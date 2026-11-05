@@ -1,0 +1,12 @@
+{
+    "display_name": "Keyword Radar",
+    "loading_order": 15,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "serioos",
+    "version": "1.1.0",
+    "homePage": "https://github.com/serioos/Keyword-Radar",
+    "auto_update": true
+}

@@ -1,0 +1,17 @@
+Keyword-Radar/
+├── manifest.json
+├── index.js
+├── settings.html
+├── style.css
+├── src/
+│   ├── constants.js
+│   ├── utils.js
+│   ├── st-bridge.js
+│   ├── state.js
+│   ├── scanner.js
+│   ├── highlighter.js
+│   └── ui.js
+├── tests/
+│   └── scanner.test.js
+├── LICENSE
+└── README.md
