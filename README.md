@@ -8,6 +8,10 @@ While typing a reply in SillyTavern, it is easy to casually use a common word—
 
 ---
 
+<img width="992" height="494" alt="brave_ojSOcA2suS" src="https://github.com/user-attachments/assets/07971c33-bf83-454d-acfa-fc1077a8c581" />
+
+---
+
 ## ✨ Key Features
 
 ### 1. Real-Time Draft Scanning
