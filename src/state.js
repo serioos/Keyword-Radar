@@ -9,6 +9,7 @@ import {
     getSTContext,
     saveChatRadarMetadata,
 } from './st-bridge.js';
+import { DEFAULT_SETTINGS } from './constants.js';
 import { makeEntryKey } from './utils.js';
 
 const MAX_DIAGNOSTIC_LOGS = 80;
@@ -108,7 +109,7 @@ export class RadarStateManager {
 
         return {
             reportGeneratedAt: new Date().toISOString(),
-            extension: 'Keyword Radar v1.1.1',
+            extension: 'Keyword Radar v1.2.1',
             environment: {
                 userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : 'node',
                 mainApi: ctx.mainApi ?? ctx.main_api ?? null,
@@ -119,7 +120,12 @@ export class RadarStateManager {
                 userMessageCount: this.getUserMessageCount(),
                 eventTypesInfo: this.environmentEventTypes,
             },
-            settings: { ...settings },
+            settings: Object.fromEntries(
+                Object.keys(DEFAULT_SETTINGS).map((key) => [key, settings[key]]),
+            ),
+            // Preserve visibility of stale preferences from older extension versions
+            // without mixing them into the active settings shown in the report.
+            legacySettingsIgnored: Object.keys(settings).filter((key) => !(key in DEFAULT_SETTINGS)),
             activeState: {
                 mutes: Array.from(this.mutes.values()).map((m) => ({
                     entryKey: m.entryKey,
@@ -255,7 +261,12 @@ export class RadarStateManager {
 
     setMute(entry, mode = 'one-turn', turns = 1) {
         const key = entry.entryKey || makeEntryKey(entry.world, entry.uid);
-        if (this.boosts.has(key)) this.boosts.delete(key);
+        // A boost may have moved into swipe memory after the previous response.
+        // Remove both active and swipe-persisted boosts before arming a mute, or a
+        // swipe/regeneration could carry conflicting force-activate + suppress actions.
+        if (this.boosts.has(key) || this.lastTurnSwipeMemory?.boosts?.has(key)) {
+            this.removeBoost(key, false);
+        }
 
         const userMsgCount = this.getUserMessageCount();
         const muteRecord = {
@@ -288,21 +299,26 @@ export class RadarStateManager {
         this.notify();
     }
 
-    removeMute(entryKey) {
+    removeMute(entryKey, notify = true) {
+        let removedFromSwipeMemory = false;
         if (this.lastTurnSwipeMemory?.mutes?.has(entryKey)) {
             this.lastTurnSwipeMemory.mutes.delete(entryKey);
+            removedFromSwipeMemory = true;
         }
-        if (!this.mutes.has(entryKey)) return;
         const existing = this.mutes.get(entryKey);
-        const wasSession = existing?.mode === 'session';
-        this.mutes.delete(entryKey);
+        const removedFromActiveState = Boolean(existing);
+        if (removedFromActiveState) this.mutes.delete(entryKey);
+        if (!removedFromActiveState && !removedFromSwipeMemory) return;
+
         this.logDiagnosticEvent('MUTE_REMOVED', {
             entryKey,
             comment: existing?.comment,
             reason: 'manual_unmute',
+            removedFromActiveState,
+            removedFromSwipeMemory,
         });
-        if (wasSession) this.persistSessionMutes();
-        this.notify();
+        if (existing?.mode === 'session') this.persistSessionMutes();
+        if (notify) this.notify();
     }
 
     clearAllMutes(includeSession = true) {
@@ -331,7 +347,11 @@ export class RadarStateManager {
 
     addBoost(normalizedEntry, turns = 1) {
         const key = normalizedEntry.entryKey || makeEntryKey(normalizedEntry.world, normalizedEntry.uid);
-        if (this.mutes.has(key)) this.removeMute(key);
+        // Symmetrically clear a mute retained for a possible swipe/regeneration;
+        // boost and mute must never coexist for the same entry across the two stores.
+        if (this.mutes.has(key) || this.lastTurnSwipeMemory?.mutes?.has(key)) {
+            this.removeMute(key, false);
+        }
 
         const userMsgCount = this.getUserMessageCount();
         this.boosts.set(key, {
@@ -358,13 +378,20 @@ export class RadarStateManager {
         this.notify();
     }
 
-    removeBoost(entryKey) {
+    removeBoost(entryKey, notify = true) {
+        let removedFromSwipeMemory = false;
         if (this.lastTurnSwipeMemory?.boosts?.has(entryKey)) {
             this.lastTurnSwipeMemory.boosts.delete(entryKey);
+            removedFromSwipeMemory = true;
         }
-        if (this.boosts.delete(entryKey)) {
-            this.logDiagnosticEvent('BOOST_REMOVED', { entryKey });
-            this.notify();
+        const removedFromActiveState = this.boosts.delete(entryKey);
+        if (removedFromActiveState || removedFromSwipeMemory) {
+            this.logDiagnosticEvent('BOOST_REMOVED', {
+                entryKey,
+                removedFromActiveState,
+                removedFromSwipeMemory,
+            });
+            if (notify) this.notify();
         }
     }
 
@@ -507,6 +534,10 @@ export class RadarStateManager {
             startedAt: Date.now(),
             userMsgCount,
         };
+        // Keep per-generation diagnostics scoped to this generation. Without this
+        // reset, a generation that does not apply a new override can report stale
+        // mute/boost actions from the previous generation.
+        this.lastGenerationActions = [];
 
         if (!dryRun) {
             this.inFlightRecursiveSnapshot = {
@@ -564,6 +595,27 @@ export class RadarStateManager {
     }
 
     onGenerationStoppedOrEnded(eventName) {
+        const hasConsumedOverrides =
+            Array.from(this.mutes.values()).some((item) => item.consumedInGeneration) ||
+            Array.from(this.boosts.values()).some((item) => item.consumedInGeneration);
+        const hasActiveLifecycle = Boolean(
+            this.currentGenerationMeta || this.inFlightRecursiveSnapshot || hasConsumedOverrides,
+        );
+
+        // SillyTavern can emit both GENERATION_STOPPED and GENERATION_ENDED for a
+        // stopped request. Some generation paths can also deliver another terminal
+        // notification after the first one. Finalize the one-turn state only once.
+        // The consumed-override fallback still supports prompt inspections / older
+        // integrations where WORLDINFO hooks ran without GENERATION_STARTED.
+        if (!hasActiveLifecycle) {
+            this.logDiagnosticEvent('GENERATION_TERMINAL_DUPLICATE_IGNORED', {
+                eventName,
+                userMessageCount: this.getUserMessageCount(),
+                reason: 'no_active_generation_or_consumed_overrides',
+            });
+            return false;
+        }
+
         const currentUserCount = this.getUserMessageCount();
         const changed = this._finalizeTurnAndMoveOneTurnToSwipeMemory(currentUserCount, false);
         this.inFlightRecursiveSnapshot = null;
@@ -573,10 +625,12 @@ export class RadarStateManager {
             userMessageCount: currentUserCount,
             activeMutesCount: this.mutes.size,
             swipeMemoryMutes: this.lastTurnSwipeMemory ? Array.from(this.lastTurnSwipeMemory.mutes.keys()) : [],
+            swipeMemoryBoosts: this.lastTurnSwipeMemory ? Array.from(this.lastTurnSwipeMemory.boosts.keys()) : [],
             lastGenerationActions: this.lastGenerationActions,
         });
 
         if (changed) this.notify();
+        return true;
     }
 
     /**
@@ -585,7 +639,8 @@ export class RadarStateManager {
      */
     onMessageDeleted() {
         const currentUserCount = this.getUserMessageCount();
-        let restored = false;
+        let restoredMutes = 0;
+        let restoredBoosts = 0;
 
         if (
             this.lastTurnSwipeMemory &&
@@ -597,14 +652,14 @@ export class RadarStateManager {
                 m.lastAppliedAtUserMsgCount = null;
                 m.armedAtUserMsgCount = currentUserCount;
                 this.mutes.set(k, m);
-                restored = true;
+                restoredMutes++;
             }
             for (const [k, b] of this.lastTurnSwipeMemory.boosts.entries()) {
                 b.consumedInGeneration = false;
                 b.lastAppliedAtUserMsgCount = null;
                 b.armedAtUserMsgCount = currentUserCount;
                 this.boosts.set(k, b);
-                restored = true;
+                restoredBoosts++;
             }
             this.lastTurnSwipeMemory = null;
         }
@@ -615,12 +670,17 @@ export class RadarStateManager {
             }
         }
 
+        const restoredAnyOverrides = restoredMutes + restoredBoosts > 0;
         this.logDiagnosticEvent('MESSAGE_DELETED', {
             currentUserCount,
-            restoredOneTurnMutesAfterInspectAbort: restored,
+            restoredOneTurnMutesAfterInspectAbort: restoredMutes > 0,
+            restoredOneTurnBoostsAfterInspectAbort: restoredBoosts > 0,
+            restoredOneTurnOverridesAfterInspectAbort: restoredAnyOverrides,
+            restoredMutesCount: restoredMutes,
+            restoredBoostsCount: restoredBoosts,
         });
 
-        if (restored) this.notify();
+        if (restoredAnyOverrides) this.notify();
     }
 
     /**
@@ -815,14 +875,27 @@ export class RadarStateManager {
         }
 
         if (effectiveBoosts.size > 0) {
-            const targetBucket =
-                (Array.isArray(loadedEntriesPayload.globalLore) && loadedEntriesPayload.globalLore) ||
-                (Array.isArray(loadedEntriesPayload.chatLore) && loadedEntriesPayload.chatLore) ||
-                (Array.isArray(loadedEntriesPayload.characterLore) && loadedEntriesPayload.characterLore) ||
-                (Array.isArray(loadedEntriesPayload) && loadedEntriesPayload) ||
-                null;
+            const chooseTargetBucket = (scope) => {
+                const preferredName = ({
+                    global: 'globalLore',
+                    chat: 'chatLore',
+                    character: 'characterLore',
+                    persona: 'personaLore',
+                })[scope];
+                if (preferredName && Array.isArray(loadedEntriesPayload[preferredName])) {
+                    return loadedEntriesPayload[preferredName];
+                }
+                // Older ST payloads may not expose every scope bucket. Preserve a
+                // safe fallback rather than dropping a requested boost.
+                return ['globalLore', 'chatLore', 'characterLore', 'personaLore']
+                    .map((name) => loadedEntriesPayload[name])
+                    .find(Array.isArray)
+                    || (Array.isArray(loadedEntriesPayload) ? loadedEntriesPayload : null);
+            };
 
-            if (targetBucket) {
+            let targetBucket = null;
+
+            {
                 const existingKeys = new Set();
                 for (const bName of bucketNames) {
                     const arr = loadedEntriesPayload[bName];
@@ -836,6 +909,7 @@ export class RadarStateManager {
                 for (const [key, boost] of effectiveBoosts.entries()) {
                     if (!boost.entrySnapshot) continue;
                     const snap = boost.entrySnapshot;
+                    targetBucket = chooseTargetBucket(snap.scope);
 
                     let forcedExisting = false;
                     for (const bName of bucketNames) {
@@ -846,12 +920,17 @@ export class RadarStateManager {
                                 it.constant = true;
                                 it.disable = false;
                                 it.probability = 100;
+                                // SillyTavern checks delayUntilRecursion before constant
+                                // activation. A manual boost is intended to force the
+                                // entry now, so clear this gate for this scan only.
+                                it.delayUntilRecursion = 0;
+                                it.delay = 0;
                                 forcedExisting = true;
                             }
                         }
                     }
 
-                    if (!forcedExisting && !existingKeys.has(key)) {
+                    if (!forcedExisting && !existingKeys.has(key) && Array.isArray(targetBucket)) {
                         const rawClone = snap.raw ? { ...snap.raw } : {};
                         targetBucket.push({
                             ...rawClone,
@@ -868,6 +947,8 @@ export class RadarStateManager {
                             constant: true,
                             disable: false,
                             probability: 100,
+                            delayUntilRecursion: 0,
+                            delay: 0,
                         });
                     }
 
@@ -909,7 +990,12 @@ export class RadarStateManager {
     /**
      * STAGE 2: Intercepts `WORLDINFO_SCAN_DONE`
      */
-    applyToScanDone(scanDonePayload, recursiveMutedKeys = new Set(), recursiveMutedEntries = []) {
+    applyToScanDone(
+        scanDonePayload,
+        recursiveMutedKeys = new Set(),
+        recursiveMutedEntries = [],
+        substituteFn = (value) => value,
+    ) {
         const removed = [];
         if (!scanDonePayload || typeof scanDonePayload !== 'object') return { removed };
 
@@ -920,8 +1006,48 @@ export class RadarStateManager {
             effectiveRecursiveEntries,
         } = this._getEffectiveTurnOverrides(currentUserCount, recursiveMutedKeys, recursiveMutedEntries);
 
+        const reportedRemovedKeys = new Set();
+        const reportRemoved = (item, matchRes, colName) => {
+            const entryKey = matchRes.matchedKey || makeEntryKey(item?.world, item?.uid);
+            if (reportedRemovedKeys.has(entryKey)) return;
+            reportedRemovedKeys.add(entryKey);
+            removed.push({
+                entryKey,
+                comment: item?.comment,
+                content: item?.content,
+                collection: colName,
+                reason: matchRes.reason || 'muted',
+            });
+        };
+
         const cleanCollection = (col, colName) => {
-            if (col instanceof Set) {
+            if (col instanceof Map) {
+                // Current SillyTavern stores activated World Info entries in a Map
+                // keyed by `${world}.${uid}`. Mutate that Map in-place: the core reads
+                // it after WORLDINFO_SCAN_DONE listeners return to build the prompt.
+                for (const [mapKey, item] of Array.from(col.entries())) {
+                    const mapKeyText = String(mapKey);
+                    const separator = mapKeyText.lastIndexOf('.');
+                    const matchTarget = item && typeof item === 'object'
+                        ? {
+                              ...item,
+                              world: item.world ?? (separator >= 0 ? mapKeyText.slice(0, separator) : ''),
+                              uid: item.uid ?? (separator >= 0 ? mapKeyText.slice(separator + 1) : mapKeyText),
+                          }
+                        : item;
+                    const matchRes = this.matchMutedItem(
+                        matchTarget,
+                        effectiveRecursiveKeys,
+                        effectiveRecursiveEntries,
+                        '',
+                        effectiveMutes,
+                    );
+                    if (matchRes.matched) {
+                        col.delete(mapKey);
+                        reportRemoved(matchTarget, matchRes, colName);
+                    }
+                }
+            } else if (col instanceof Set) {
                 for (const item of Array.from(col)) {
                     const matchRes = this.matchMutedItem(
                         item,
@@ -932,11 +1058,7 @@ export class RadarStateManager {
                     );
                     if (matchRes.matched) {
                         col.delete(item);
-                        removed.push({
-                            entryKey: matchRes.matchedKey || makeEntryKey(item?.world, item?.uid),
-                            comment: item?.comment,
-                            collection: colName,
-                        });
+                        reportRemoved(item, matchRes, colName);
                     }
                 }
             } else if (Array.isArray(col)) {
@@ -951,28 +1073,75 @@ export class RadarStateManager {
                     );
                     if (matchRes.matched) {
                         col.splice(i, 1);
-                        removed.push({
-                            entryKey: matchRes.matchedKey || makeEntryKey(item?.world, item?.uid),
-                            comment: item?.comment,
-                            collection: colName,
-                        });
+                        reportRemoved(item, matchRes, colName);
                     }
                 }
             }
         };
 
+        // Current SillyTavern emits a structured object for every scan loop:
+        // { state, new: { all, successful }, activated: { entries: Map, text }, ... }.
+        // Keep compatibility with older builds that supplied arrays/sets at the root.
         if (scanDonePayload instanceof Set || Array.isArray(scanDonePayload)) {
             cleanCollection(scanDonePayload, 'root');
         } else {
-            for (const [k, val] of Object.entries(scanDonePayload)) {
-                if (val instanceof Set || Array.isArray(val)) cleanCollection(val, k);
+            cleanCollection(scanDonePayload.new?.all, 'new.all');
+            cleanCollection(scanDonePayload.new?.successful, 'new.successful');
+            cleanCollection(scanDonePayload.activated?.entries, 'activated.entries');
+            cleanCollection(scanDonePayload.sortedEntries, 'sortedEntries');
+
+            // The event's text string is consumed by the core after listeners return.
+            // Remove each muted injection from that exact mutable field as a final
+            // safeguard; Stage 4 also verifies the final outgoing prompt.
+            if (typeof scanDonePayload.activated?.text === 'string' && removed.length > 0) {
+                let text = scanDonePayload.activated.text;
+                for (const item of removed) {
+                    const rawContent = String(item.content || '').trim();
+                    if (!rawContent || rawContent.length < 4) continue;
+                    const candidates = [rawContent];
+                    try {
+                        const substituted = String(substituteFn(rawContent) || '').trim();
+                        if (substituted && substituted !== rawContent) candidates.push(substituted);
+                    } catch {
+                        // Macro substitution is best-effort; raw content remains available.
+                    }
+                    for (const needle of candidates) {
+                        const index = text.indexOf(needle);
+                        if (index >= 0) {
+                            text = `${text.slice(0, index)}${text.slice(index + needle.length)}`;
+                            break;
+                        }
+                    }
+                }
+                scanDonePayload.activated.text = text.replace(/\n{3,}/g, '\n\n').trim();
             }
         }
 
         this.logDiagnosticEvent('STAGE2_WORLDINFO_SCAN_DONE', {
             payloadKeys: Object.keys(scanDonePayload),
+            scanState: scanDonePayload.state && typeof scanDonePayload.state === 'object'
+                ? {
+                      current: scanDonePayload.state.current ?? null,
+                      next: scanDonePayload.state.next ?? null,
+                      loopCount: scanDonePayload.state.loopCount ?? null,
+                  }
+                : null,
+            recursionDelay: scanDonePayload.recursionDelay && typeof scanDonePayload.recursionDelay === 'object'
+                ? {
+                      currentLevel: scanDonePayload.recursionDelay.currentLevel ?? null,
+                      availableLevels: Array.isArray(scanDonePayload.recursionDelay.availableLevels)
+                          ? [...scanDonePayload.recursionDelay.availableLevels]
+                          : [],
+                  }
+                : null,
+            budget: scanDonePayload.budget && typeof scanDonePayload.budget === 'object'
+                ? {
+                      current: scanDonePayload.budget.current ?? null,
+                      overflowed: Boolean(scanDonePayload.budget.overflowed),
+                  }
+                : null,
             removedCount: removed.length,
-            removed,
+            removed: removed.map(({ content, ...item }) => ({ ...item, contentLength: String(content || '').length })),
         });
 
         return { removed };

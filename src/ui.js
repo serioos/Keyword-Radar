@@ -757,9 +757,9 @@ export class RadarUIController {
                             <span>${isMuted ? 'Unmute Entry' : 'Mute 1 Turn'}</span>
                         </button>
                     `}
-                    <button type="button" class="kr-btn kr-btn-secondary" data-kr-pop-action="mute-session">
-                        <i class="fa-solid fa-ban"></i>
-                        <span>Mute for Chat</span>
+                    <button type="button" class="kr-btn kr-btn-secondary" data-kr-pop-action="${muteInfo?.mode === 'session' ? 'unmute-session' : 'mute-session'}">
+                        <i class="fa-solid ${muteInfo?.mode === 'session' ? 'fa-volume-high' : 'fa-ban'}"></i>
+                        <span>${muteInfo?.mode === 'session' ? 'Unmute for Chat' : 'Mute for Chat'}</span>
                     </button>
                 </div>
                 <div class="kr-pop-footer-right">
@@ -786,8 +786,10 @@ export class RadarUIController {
                 this.closePopover();
             } else if (act === 'toggle-mute') {
                 this._handleToggleMuteByKey(entryKey);
+                this.closePopover();
             } else if (act === 'unmute-parents') {
                 this._handleUnmuteParentsByChildKey(entryKey);
+                this.closePopover();
             } else if (act === 'mute-session') {
                 this.state.setMute(
                     {
@@ -800,6 +802,10 @@ export class RadarUIController {
                     },
                     'session',
                 );
+                this.closePopover();
+            } else if (act === 'unmute-session') {
+                this.state.removeMute(entryKey);
+                this.closePopover();
             } else if (act === 'quick-edit') {
                 this.closePopover();
                 this.openQuickEditModal(entry);
@@ -885,9 +891,11 @@ export class RadarUIController {
             <button type="button" class="kr-ctx-item" data-kr-ctx="mute-10">
                 <i class="fa-solid fa-hourglass-end"></i> Mute for 10 Turns
             </button>
-            <button type="button" class="kr-ctx-item" data-kr-ctx="mute-session">
-                <i class="fa-solid fa-ban"></i> Mute for Remainder of Chat
-            </button>
+            ${muteInfo?.mode === 'session' ? '' : `
+                <button type="button" class="kr-ctx-item" data-kr-ctx="mute-session">
+                    <i class="fa-solid fa-ban"></i> Mute for Remainder of Chat
+                </button>
+            `}
             <div class="kr-ctx-divider"></div>
             ${item?.entry ? `
                 <button type="button" class="kr-ctx-item" data-kr-ctx="quick-edit">

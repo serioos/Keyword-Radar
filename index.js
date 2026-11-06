@@ -95,6 +95,22 @@ import { debounce, TokenCache } from './src/utils.js';
         runScanAgainstCachedLore(false);
     }, 120);
 
+    // Coalesce closely spaced lifecycle notifications (for example, MESSAGE_RECEIVED,
+    // GENERATION_STOPPED and GENERATION_ENDED). Preserve the strongest requested
+    // refresh: only message/book changes force collection; terminal notifications
+    // alone reuse the existing snapshot as before.
+    let lifecycleRefreshNeedsReload = false;
+    const debouncedLifecycleRefresh = debounce(() => {
+        const forceReload = lifecycleRefreshNeedsReload;
+        lifecycleRefreshNeedsReload = false;
+        if (forceReload) refreshLoreSnapshotAndScan(true);
+        else runScanAgainstCachedLore(false);
+    }, 120);
+    const scheduleLifecycleRefresh = (forceReload = false) => {
+        lifecycleRefreshNeedsReload = lifecycleRefreshNeedsReload || Boolean(forceReload);
+        debouncedLifecycleRefresh();
+    };
+
     /**
      * Reads current draft text from `#send_textarea`.
      * @returns {string}
@@ -380,7 +396,7 @@ import { debounce, TokenCache } from './src/utils.js';
             if (!settings.enabled) return;
 
             const { recursiveMutedKeys, recursiveMutedEntries } = getActiveRecursiveMuteContext();
-            stateManager.applyToScanDone(scanDonePayload, recursiveMutedKeys, recursiveMutedEntries);
+            stateManager.applyToScanDone(scanDonePayload, recursiveMutedKeys, recursiveMutedEntries, substituteMacros);
         });
 
         // Stage 3: WORLD_INFO_ACTIVATED
@@ -445,22 +461,24 @@ import { debounce, TokenCache } from './src/utils.js';
         // Track AI reply arrival & generation stop/end
         eventSource.on(boundEventsInfo.MESSAGE_RECEIVED, () => {
             stateManager.onAiMessageReceived();
-            setTimeout(() => refreshLoreSnapshotAndScan(true), 120);
+            scheduleLifecycleRefresh(true);
         });
 
         eventSource.on(boundEventsInfo.GENERATION_STOPPED, () => {
-            stateManager.onGenerationStoppedOrEnded('GENERATION_STOPPED');
-            setTimeout(() => runScanAgainstCachedLore(false), 120);
+            if (stateManager.onGenerationStoppedOrEnded('GENERATION_STOPPED')) {
+                scheduleLifecycleRefresh(false);
+            }
         });
 
         eventSource.on(boundEventsInfo.GENERATION_ENDED, () => {
-            stateManager.onGenerationStoppedOrEnded('GENERATION_ENDED');
-            setTimeout(() => runScanAgainstCachedLore(false), 120);
+            if (stateManager.onGenerationStoppedOrEnded('GENERATION_ENDED')) {
+                scheduleLifecycleRefresh(false);
+            }
         });
 
         eventSource.on(boundEventsInfo.MESSAGE_DELETED, () => {
             stateManager.onMessageDeleted();
-            setTimeout(() => refreshLoreSnapshotAndScan(true), 120);
+            scheduleLifecycleRefresh(true);
         });
 
         // Re-scan when messages are swiped, edited, or World Info settings change
@@ -474,7 +492,7 @@ import { debounce, TokenCache } from './src/utils.js';
         for (const evName of rescanEvents) {
             if (evName) {
                 eventSource.on(evName, () => {
-                    setTimeout(() => refreshLoreSnapshotAndScan(true), 120);
+                    scheduleLifecycleRefresh(true);
                 });
             }
         }
@@ -617,7 +635,7 @@ import { debounce, TokenCache } from './src/utils.js';
         stateManager.syncFromChatMetadata();
         await refreshLoreSnapshotAndScan(true);
 
-        console.info(`[${EXTENSION_DISPLAY_NAME}] Initialized (${EXTENSION_NAME} v1.1.1).`);
+        console.info(`[${EXTENSION_DISPLAY_NAME}] Initialized (${EXTENSION_NAME} v1.2.1).`);
     }
 
     if (typeof jQuery !== 'undefined') {

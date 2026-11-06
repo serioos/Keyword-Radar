@@ -66,117 +66,106 @@ export function matchSingleKeyInText(haystack, rawKey, options) {
 
     try {
         if (regexDescriptor) {
-            let flags = regexDescriptor.flags;
-            if (!options.caseSensitive && !flags.includes('i')) {
-                flags += 'i';
+            // SillyTavern treats a regex key as a regex verbatim. Entry/global
+            // case-sensitivity and whole-word settings do not alter its flags.
+            const flags = regexDescriptor.flags;
+            const detectionRx = new RegExp(regexDescriptor.pattern, flags);
+            const detectionMatch = detectionRx.test(haystack);
+            if (!detectionMatch || !options.collectSpans) {
+                return {
+                    matched: detectionMatch,
+                    key: rawKey,
+                    matchedText: detectionMatch ? (haystack.match(new RegExp(regexDescriptor.pattern, flags))?.[0] || '') : '',
+                    spans: [],
+                };
             }
-            const globalFlags = flags.includes('g') ? flags : `${flags}g`;
-            const rx = new RegExp(regexDescriptor.pattern, globalFlags);
+
+            // Keep the user's regex flags. Global expressions can provide multiple
+            // highlight spans; non-global expressions match once just like ST's test().
+            const rx = new RegExp(regexDescriptor.pattern, flags);
             const spans = [];
             let firstText = '';
             let m;
             let safety = 0;
-
-            while ((m = rx.exec(haystack)) !== null && safety++ < 250) {
-                if (m[0].length === 0) {
-                    rx.lastIndex++;
-                    continue;
-                }
-                if (!firstText) firstText = m[0];
-                if (options.collectSpans) {
+            do {
+                m = rx.exec(haystack);
+                if (!m) break;
+                if (m[0].length > 0) {
+                    if (!firstText) firstText = m[0];
                     spans.push({
                         start: m.index,
                         end: m.index + m[0].length,
                         text: m[0],
                         key: rawKey,
                     });
-                } else {
-                    return { matched: true, key: rawKey, matchedText: m[0], spans: [] };
                 }
-            }
-
-            return {
-                matched: spans.length > 0 || Boolean(firstText),
-                key: rawKey,
-                matchedText: firstText,
-                spans,
-            };
-        }
-
-        // Plain-text keyword matching
-        const escaped = escapeRegExp(substitutedKey);
-        const flags = options.caseSensitive ? 'g' : 'gi';
-        // SillyTavern applies whole-word boundary checks when matchWholeWords is enabled and key has no whitespace
-        const useWordBoundaries = Boolean(options.matchWholeWords) && !/\W/.test(substitutedKey);
-
-        if (useWordBoundaries) {
-            const rx = new RegExp(`(?:^|\\W)(${escaped})(?:$|\\W)`, flags);
-            const spans = [];
-            let firstText = '';
-            let m;
-            let safety = 0;
-
-            while ((m = rx.exec(haystack)) !== null && safety++ < 250) {
-                const wordMatch = m[1];
-                const leadOffset = m[0].indexOf(wordMatch);
-                const actualStart = m.index + (leadOffset >= 0 ? leadOffset : 0);
-                const actualEnd = actualStart + wordMatch.length;
-
-                if (!firstText) firstText = wordMatch;
-                if (options.collectSpans) {
-                    spans.push({
-                        start: actualStart,
-                        end: actualEnd,
-                        text: wordMatch,
-                        key: rawKey,
-                    });
-                } else {
-                    return { matched: true, key: rawKey, matchedText: wordMatch, spans: [] };
-                }
-                // Rewind lastIndex by 1 if trailing non-word char could be the leading boundary of the next match
-                if (rx.lastIndex > actualEnd) {
-                    rx.lastIndex = actualEnd;
-                }
-            }
-
-            return {
-                matched: spans.length > 0 || Boolean(firstText),
-                key: rawKey,
-                matchedText: firstText,
-                spans,
-            };
-        } else {
-            const rx = new RegExp(escaped, flags);
-            const spans = [];
-            let firstText = '';
-            let m;
-            let safety = 0;
-
-            while ((m = rx.exec(haystack)) !== null && safety++ < 250) {
-                if (m[0].length === 0) {
+                // A global zero-width match must always advance or exec() can loop forever.
+                if (m[0].length === 0 && (rx.global || rx.sticky)) {
                     rx.lastIndex++;
-                    continue;
                 }
-                if (!firstText) firstText = m[0];
-                if (options.collectSpans) {
-                    spans.push({
-                        start: m.index,
-                        end: m.index + m[0].length,
-                        text: m[0],
-                        key: rawKey,
-                    });
-                } else {
-                    return { matched: true, key: rawKey, matchedText: m[0], spans: [] };
-                }
-            }
+                safety++;
+            } while (rx.global && safety < 250);
 
             return {
-                matched: spans.length > 0 || Boolean(firstText),
+                matched: true,
                 key: rawKey,
                 matchedText: firstText,
                 spans,
             };
         }
+
+        // SillyTavern lowercases both sides for plain-text matching when insensitive.
+        const normalizedHaystack = options.caseSensitive ? String(haystack) : String(haystack).toLowerCase();
+        const normalizedKey = options.caseSensitive ? substitutedKey : substitutedKey.toLowerCase();
+        const escaped = escapeRegExp(normalizedKey);
+        const useWholeWords = Boolean(options.matchWholeWords);
+        // ST applies boundary checks to single whitespace-delimited words only.
+        // Multi-word phrases are literal substrings, even when they contain punctuation.
+        const hasMultipleWords = normalizedKey.split(/\s+/).length > 1;
+        const useWordBoundaries = useWholeWords && !hasMultipleWords;
+        const rx = useWordBoundaries
+            ? new RegExp(`(?:^|\\W)(${escaped})(?:$|\\W)`, 'g')
+            : new RegExp(escaped, 'g');
+        const spans = [];
+        let firstText = '';
+        let m;
+        let safety = 0;
+
+        while ((m = rx.exec(normalizedHaystack)) !== null && safety++ < 250) {
+            const wordMatch = useWordBoundaries ? m[1] : m[0];
+            if (!wordMatch.length) {
+                rx.lastIndex++;
+                continue;
+            }
+            const leadOffset = useWordBoundaries ? m[0].indexOf(wordMatch) : 0;
+            const actualStart = m.index + Math.max(0, leadOffset);
+            const actualEnd = actualStart + wordMatch.length;
+            const originalText = String(haystack).slice(actualStart, actualEnd);
+            if (!firstText) firstText = originalText;
+
+            if (options.collectSpans) {
+                spans.push({
+                    start: actualStart,
+                    end: actualEnd,
+                    text: originalText,
+                    key: rawKey,
+                });
+            } else {
+                return { matched: true, key: rawKey, matchedText: originalText, spans: [] };
+            }
+
+            // Reuse a trailing boundary as the next match's leading boundary.
+            if (useWordBoundaries && rx.lastIndex > actualEnd) {
+                rx.lastIndex = actualEnd;
+            }
+        }
+
+        return {
+            matched: spans.length > 0 || Boolean(firstText),
+            key: rawKey,
+            matchedText: firstText,
+            spans,
+        };
     } catch {
         return emptyResult;
     }
@@ -185,31 +174,38 @@ export function matchSingleKeyInText(haystack, rawKey, options) {
 /**
  * Checks whether an entry passes its optional `characterFilter` against the active character.
  * @param {any} entry
- * @param {{ characterAvatar?: string, characterFullAvatar?: string, name2?: string, characterTags?: string[] }} scanContext
+ * @param {{ characterAvatar?: string, characterFilename?: string, characterFullAvatar?: string, name2?: string, characterTags?: string[] }} scanContext
  * @returns {boolean}
  */
 export function passesCharacterFilter(entry, scanContext) {
     const cf = entry.characterFilter;
     if (!cf) return true;
 
-    const hasNames = Array.isArray(cf.names) && cf.names.length > 0;
-    const hasTags = Array.isArray(cf.tags) && cf.tags.length > 0;
-    if (!hasNames && !hasTags) return true;
+    const names = Array.isArray(cf.names) ? cf.names : [];
+    const tags = Array.isArray(cf.tags) ? cf.tags : [];
+    const isExclude = Boolean(cf.isExclude);
 
-    const avatarClean = String(scanContext.characterAvatar || '').toLowerCase();
-    const avatarFull = String(scanContext.characterFullAvatar || '').toLowerCase();
-    const charName = String(scanContext.name2 || '').toLowerCase();
-    const activeTags = new Set((scanContext.characterTags || []).map((t) => String(t).toLowerCase()));
+    // SillyTavern evaluates name and tag constraints independently. If both
+    // are configured, both constraints must pass (rather than either matching).
+    if (names.length > 0) {
+        const characterFilename = String(scanContext.characterFilename || scanContext.characterAvatar || scanContext.characterFullAvatar || '')
+            .split(/[\\/]/)
+            .pop()
+            .replace(/\.png$/i, '');
+        const nameMatched = names.includes(characterFilename);
+        if (isExclude ? nameMatched : !nameMatched) return false;
+    }
 
-    const nameMatched = hasNames && cf.names.some((n) => {
-        const lower = String(n).replace(/\.png$/i, '').toLowerCase();
-        return lower === avatarClean || lower === avatarFull || lower === charName;
-    });
+    // Core skips tag filtering if it cannot resolve a tag-map key for the
+    // active entity. An available empty tag list, however, is a real no-match.
+    const hasTagMap = scanContext.characterTagsAvailable !== false && Array.isArray(scanContext.characterTags);
+    if (tags.length > 0 && hasTagMap) {
+        const activeTags = new Set(scanContext.characterTags.map(String));
+        const tagMatched = tags.some((tag) => activeTags.has(String(tag)));
+        if (isExclude ? tagMatched : !tagMatched) return false;
+    }
 
-    const tagMatched = hasTags && cf.tags.some((t) => activeTags.has(String(t).toLowerCase()));
-    const anyMatch = nameMatched || tagMatched;
-
-    return cf.isExclude ? !anyMatch : anyMatch;
+    return true;
 }
 
 /**
@@ -353,6 +349,48 @@ export function evaluateEntryKeysAgainstBuffer(entry, fullScanBuffer, draftText,
     };
 }
 
+
+/**
+ * Calculates SillyTavern's inclusion-group score for an entry against one scan
+ * buffer. Primary matches always score; secondary matches score for AND ANY,
+ * and for AND ALL only when every secondary key matched. NOT logics do not add
+ * secondary score. This is used only for the radar's predictive view.
+ */
+export function calculateEntryGroupScore(entry, text, globalMatchOpts) {
+    const keys = Array.isArray(entry?.key) ? entry.key.filter(Boolean) : [];
+    if (keys.length === 0) return 0;
+
+    const caseSensitive = entry.caseSensitive !== null && entry.caseSensitive !== undefined
+        ? Boolean(entry.caseSensitive)
+        : Boolean(globalMatchOpts.caseSensitive);
+    const matchWholeWords = entry.matchWholeWords !== null && entry.matchWholeWords !== undefined
+        ? Boolean(entry.matchWholeWords)
+        : Boolean(globalMatchOpts.matchWholeWords);
+    const opts = {
+        caseSensitive,
+        matchWholeWords,
+        substituteFn: globalMatchOpts.substituteFn,
+        collectSpans: false,
+    };
+    const primaryScore = keys.reduce(
+        (score, key) => score + (matchSingleKeyInText(text, key, opts).matched ? 1 : 0),
+        0,
+    );
+    const secondary = Array.isArray(entry.keysecondary) ? entry.keysecondary.filter(Boolean) : [];
+    if (secondary.length === 0) return primaryScore;
+
+    const secondaryScore = secondary.reduce(
+        (score, key) => score + (matchSingleKeyInText(text, key, opts).matched ? 1 : 0),
+        0,
+    );
+    const logic = Number(entry.selectiveLogic ?? SELECTIVE_LOGIC.AND_ANY);
+    if (logic === SELECTIVE_LOGIC.AND_ANY) return primaryScore + secondaryScore;
+    if (logic === SELECTIVE_LOGIC.AND_ALL && secondaryScore === secondary.length) {
+        return primaryScore + secondaryScore;
+    }
+    return primaryScore;
+}
+
 /**
  * Builds the text scan buffer for a given scanDepth from recent chat messages + optional draft message.
  * Mirrors SillyTavern's `WorldInfoBuffer` depth slicing.
@@ -365,7 +403,7 @@ export function evaluateEntryKeysAgainstBuffer(entry, fullScanBuffer, draftText,
  * @returns {string}
  */
 export function buildDepthBuffer(chatMessages, draftText, depth, includeNames, userName = 'User') {
-    const effectiveDepth = Math.max(0, Number(depth) || 0);
+    const effectiveDepth = Math.min(1000, Math.max(0, Number(depth) || 0));
     if (effectiveDepth === 0) return '';
 
     const messages = Array.isArray(chatMessages) ? chatMessages.slice() : [];
@@ -393,7 +431,9 @@ export function buildDepthBuffer(chatMessages, draftText, depth, includeNames, u
         }
     }
 
-    return chunks.join('\n');
+    // SillyTavern uses a non-word marker before each depth-buffer message. It
+    // also keeps a marker when the selected depth contains no chat messages.
+    return `\x01${chunks.join('\n\x01')}`;
 }
 
 /**
@@ -403,8 +443,8 @@ export function buildDepthBuffer(chatMessages, draftText, depth, includeNames, u
  * @param {any} extraScanFields
  * @returns {string}
  */
-function appendExtraMatchFields(entry, baseBuffer, extraScanFields) {
-    if (!extraScanFields) return baseBuffer;
+function appendExtraMatchFields(entry, baseBuffer, extraScanFields, allowAuxiliary = true) {
+    if (!allowAuxiliary || !extraScanFields) return baseBuffer;
     const extras = [];
     if (entry.matchPersonaDescription && extraScanFields.personaDescription) {
         extras.push(extraScanFields.personaDescription);
@@ -423,6 +463,11 @@ function appendExtraMatchFields(entry, baseBuffer, extraScanFields) {
     }
     if (entry.matchCreatorNotes && extraScanFields.creatorNotes) {
         extras.push(extraScanFields.creatorNotes);
+    }
+    // Global scan-enabled extension prompts are appended for every entry by
+    // SillyTavern's WorldInfoBuffer, independent of per-entry auxiliary flags.
+    if (extraScanFields.injectionPrompts) {
+        extras.push(extraScanFields.injectionPrompts);
     }
     if (extras.length === 0) return baseBuffer;
     return `${baseBuffer}\n${extras.join('\n')}`;
@@ -523,11 +568,122 @@ export function runPreSendRadarScan(params) {
     const eligibleEntries = [];
     for (const entry of entries) {
         if (entry.disable) continue;
-        if (cooldownSet.has(entry.entryKey)) continue;
+        if (Array.isArray(entry.decorators) && entry.decorators.includes('@@dont_activate')) continue;
+        if (cooldownSet.has(entry.entryKey) && !boostedEntriesMap.has(entry.entryKey)) continue;
         // Delay check: entry cannot activate until at least `entry.delay` messages exist in chat
         if (entry.delay > 0 && totalChatLength + 1 < entry.delay) continue;
         if (!passesCharacterFilter(entry, scanContext || {})) continue;
+        const requiredTriggers = Array.isArray(entry.triggers) ? entry.triggers : [];
+        const generationTrigger = String(scanContext?.generationTrigger || 'normal');
+        if (requiredTriggers.length > 0 && !requiredTriggers.includes(generationTrigger)) continue;
         eligibleEntries.push(entry);
+    }
+
+    // SillyTavern can increase the global depth one message at a time until
+    // `minActivations` is reached. Model that pre-pass when recursion is off;
+    // with recursion on, recursive activations can satisfy the threshold and
+    // the complete engine's loop ordering is more involved than a local preview.
+    let effectiveGlobalScanDepth = Math.max(0, Number(globalSettings.scanDepth ?? 2));
+    const minActivations = Math.max(0, Number(globalSettings.minActivations || 0));
+    const canPredictMinActivationDepth = minActivations > 0
+        && !globalSettings.recursive
+        && !(Number(globalSettings.maxRecursionSteps) > 0)
+        && !simulateRecursionAlways;
+    if (canPredictMinActivationDepth) {
+        const maxAvailableDepth = totalChatLength + (cleanDraft.trim().length > 0 ? 1 : 0);
+        const configuredMaxDepth = Math.max(0, Number(globalSettings.minActivationsDepthMax || 0));
+        const stopDepth = configuredMaxDepth > 0
+            ? Math.min(configuredMaxDepth, maxAvailableDepth)
+            : maxAvailableDepth;
+
+        const countDirectAtDepth = (globalDepth) => {
+            const candidates = [];
+            for (const entry of eligibleEntries) {
+                const depth = entry.scanDepth !== null && entry.scanDepth !== undefined
+                    ? Number(entry.scanDepth)
+                    : globalDepth;
+                const isSticky = stickySet.has(entry.entryKey);
+                const isConstant = Boolean(entry.constant);
+                const isBoosted = boostedEntriesMap.has(entry.entryKey);
+                const delayed = entry.delayUntilRecursion > 0 && !isSticky && !isBoosted;
+                const decoratorActivated = Array.isArray(entry.decorators) && entry.decorators.includes('@@activate');
+                if (isSticky || isBoosted) {
+                    candidates.push({ entry, sticky: isSticky, score: 0 });
+                    continue;
+                }
+                // Core applies delayUntilRecursion before decorators and constant
+                // activation. Sticky entries bypass it; one-turn boosts clear the
+                // entry's delayUntilRecursion value in Stage 1.
+                if (delayed) continue;
+                if (isConstant) {
+                    candidates.push({ entry, sticky: false, score: 0 });
+                    continue;
+                }
+                if (decoratorActivated) {
+                    candidates.push({ entry, sticky: false, score: 0 });
+                    continue;
+                }
+                if (depth <= 0) continue;
+                const base = cleanDraft.trim().length > 0 ? getWithDraftBuffer(depth) : getHistoryBuffer(depth);
+                const buffer = appendExtraMatchFields(entry, base, scanContext?.extraScanFields, depth > 0);
+                if (evaluateEntryKeysAgainstBuffer(entry, buffer, '', globalMatchOpts).triggered) {
+                    candidates.push({
+                        entry,
+                        sticky: false,
+                        score: calculateEntryGroupScore(entry, buffer, globalMatchOpts),
+                    });
+                }
+            }
+
+            const losingKeys = new Set();
+            const groups = new Map();
+            for (const candidate of candidates) {
+                for (const groupName of String(candidate.entry.group || '').split(',').map((name) => name.trim()).filter(Boolean)) {
+                    if (!groups.has(groupName)) groups.set(groupName, []);
+                    groups.get(groupName).push(candidate);
+                }
+            }
+            for (const group of groups.values()) {
+                if (group.length < 2) continue;
+                const stickyCandidates = group.filter((candidate) => candidate.sticky);
+                if (stickyCandidates.length > 0) {
+                    for (const candidate of group) {
+                        if (!candidate.sticky) losingKeys.add(candidate.entry.entryKey);
+                    }
+                    continue;
+                }
+                const scoringEnabled = Boolean(globalSettings.useGroupScoring)
+                    || group.some((candidate) => candidate.entry.useGroupScoring === true);
+                if (scoringEnabled) {
+                    const maxScore = Math.max(...group.map((candidate) => candidate.score));
+                    for (const candidate of group) {
+                        const enabled = candidate.entry.useGroupScoring ?? Boolean(globalSettings.useGroupScoring);
+                        if (enabled && candidate.score < maxScore) losingKeys.add(candidate.entry.entryKey);
+                    }
+                }
+                const remaining = group.filter((candidate) => !losingKeys.has(candidate.entry.entryKey));
+                if (remaining.length > 1) {
+                    const priorityWinners = remaining.filter((candidate) => Boolean(candidate.entry.groupOverride))
+                        .sort((a, b) => Number(b.entry.order || 0) - Number(a.entry.order || 0));
+                    if (priorityWinners.length > 0) {
+                        for (const candidate of remaining) {
+                            if (candidate.entry.entryKey !== priorityWinners[0].entry.entryKey) {
+                                losingKeys.add(candidate.entry.entryKey);
+                            }
+                        }
+                    }
+                }
+            }
+            return candidates.reduce((count, candidate) => count + (losingKeys.has(candidate.entry.entryKey) ? 0 : 1), 0);
+        };
+
+        let activeCount = countDirectAtDepth(effectiveGlobalScanDepth);
+        // Core tests `depth > max` after each pass, so the final pass can be
+        // one level beyond the configured cap. Preserve that boundary behavior.
+        while (activeCount < minActivations && effectiveGlobalScanDepth <= stopDepth) {
+            effectiveGlobalScanDepth += 1;
+            activeCount = countDirectAtDepth(effectiveGlobalScanDepth);
+        }
     }
 
     /**
@@ -549,27 +705,28 @@ export function runPreSendRadarScan(params) {
     for (const entry of eligibleEntries) {
         const effectiveDepth = (entry.scanDepth !== null && entry.scanDepth !== undefined)
             ? Number(entry.scanDepth)
-            : Number(globalSettings.scanDepth ?? 2);
+            : effectiveGlobalScanDepth;
 
         const isSticky = stickySet.has(entry.entryKey);
         const isConstant = Boolean(entry.constant);
         const isBoosted = boostedEntriesMap.has(entry.entryKey);
+        const isDecoratorActivated = Array.isArray(entry.decorators) && entry.decorators.includes('@@activate');
         const isDirectlyMuted = mutedKeys.has(entry.entryKey);
 
-        // If entry has delayUntilRecursion > 0, it cannot trigger in the direct (non-recursive) pass
-        // unless it's constant, sticky, or manually boosted
-        const delayedForRecursionOnly = entry.delayUntilRecursion > 0 && !isConstant && !isSticky && !isBoosted;
+        // Current SillyTavern delays entries before constant/decorator checks.
+        // Sticky entries bypass that gate; Stage 1 clears it for one-turn boosts.
+        const delayedForRecursionOnly = entry.delayUntilRecursion > 0 && !isSticky && !isBoosted;
 
         let baselineEval = null;
         let withDraftEval = null;
         let draftOnlyEval = null;
 
         if (!delayedForRecursionOnly && effectiveDepth > 0) {
-            const histBuf = appendExtraMatchFields(entry, getHistoryBuffer(effectiveDepth), scanContext?.extraScanFields);
+            const histBuf = appendExtraMatchFields(entry, getHistoryBuffer(effectiveDepth), scanContext?.extraScanFields, effectiveDepth > 0);
             baselineEval = evaluateEntryKeysAgainstBuffer(entry, histBuf, '', globalMatchOpts);
 
             if (cleanDraft.trim().length > 0) {
-                const draftBuf = appendExtraMatchFields(entry, getWithDraftBuffer(effectiveDepth), scanContext?.extraScanFields);
+                const draftBuf = appendExtraMatchFields(entry, getWithDraftBuffer(effectiveDepth), scanContext?.extraScanFields, effectiveDepth > 0);
                 withDraftEval = evaluateEntryKeysAgainstBuffer(entry, draftBuf, cleanDraft, globalMatchOpts);
                 draftOnlyEval = evaluateEntryKeysAgainstBuffer(entry, draftOnlyBuffer, cleanDraft, globalMatchOpts);
             } else {
@@ -586,11 +743,13 @@ export function runPreSendRadarScan(params) {
                     (withDraftEval.draftMatchedSecondaryKeys?.length || 0) > 0)),
         );
 
-        if (isConstant || isSticky || activeInHistory) {
+        const decoratorCanActivate = isDecoratorActivated && !delayedForRecursionOnly;
+        const constantCanActivate = isConstant && !delayedForRecursionOnly;
+        if (isSticky || (!delayedForRecursionOnly && (isConstant || activeInHistory || decoratorCanActivate))) {
             baselineActiveKeys.add(entry.entryKey);
         }
 
-        const wouldActivateDirectly = isConstant || isSticky || isBoosted || activeWithDraftKeywords;
+        const wouldActivateDirectly = isSticky || isBoosted || constantCanActivate || decoratorCanActivate || activeWithDraftKeywords;
         if (wouldActivateDirectly) {
             directWithDraftKeys.add(entry.entryKey);
         }
@@ -612,7 +771,7 @@ export function runPreSendRadarScan(params) {
                 status = TRIGGER_STATUS.NEW_DIRECT;
             } else if (isSticky) {
                 status = TRIGGER_STATUS.ACTIVE_STICKY;
-            } else if (isConstant) {
+            } else if (constantCanActivate || decoratorCanActivate) {
                 status = TRIGGER_STATUS.ACTIVE_CONSTANT;
             } else if (activeInHistory) {
                 status = TRIGGER_STATUS.ACTIVE_HISTORY;
@@ -666,6 +825,77 @@ export function runPreSendRadarScan(params) {
                 isMuted: isDirectlyMuted,
                 isBoosted: true,
             });
+        }
+    }
+
+    // Inclusion-group scoring mirrors SillyTavern's score-based pruning for
+    // direct candidates. Weighted-random/groupOverride selection is intentionally
+    // not simulated because the result is stochastic and can change on each run.
+    const directGroupCandidates = Array.from(resultsMap.values()).filter(
+        (node) => String(node.entry?.group || '').trim().length > 0,
+    );
+    const groupedCandidates = new Map();
+    for (const node of directGroupCandidates) {
+        for (const groupName of String(node.entry.group).split(',').map((name) => name.trim()).filter(Boolean)) {
+            if (!groupedCandidates.has(groupName)) groupedCandidates.set(groupName, []);
+            groupedCandidates.get(groupName).push(node);
+        }
+    }
+
+    for (const [groupName, candidates] of groupedCandidates.entries()) {
+        if (candidates.length < 2) continue;
+        const scoringEnabledForGroup = Boolean(globalSettings.useGroupScoring)
+            || candidates.some((node) => node.entry.useGroupScoring === true);
+        if (!scoringEnabledForGroup) continue;
+        let liveCandidates = candidates.filter((node) => resultsMap.has(node.entryKey));
+        // A sticky member wins its inclusion group before score/priority rules.
+        const stickyCandidates = liveCandidates.filter((node) => stickySet.has(node.entryKey));
+        if (stickyCandidates.length > 0) {
+            for (const node of liveCandidates) {
+                if (stickySet.has(node.entryKey)) continue;
+                resultsMap.delete(node.entryKey);
+                baselineActiveKeys.delete(node.entryKey);
+            }
+            continue;
+        }
+
+        const scored = liveCandidates.map((node) => {
+            const depth = node.entry.scanDepth !== null && node.entry.scanDepth !== undefined
+                ? Number(node.entry.scanDepth)
+                : effectiveGlobalScanDepth;
+            const text = appendExtraMatchFields(
+                node.entry,
+                cleanDraft.trim().length > 0 ? getWithDraftBuffer(depth) : getHistoryBuffer(depth),
+                scanContext?.extraScanFields,
+                depth > 0,
+            );
+            return {
+                node,
+                score: calculateEntryGroupScore(node.entry, text, globalMatchOpts),
+                enabled: node.entry.useGroupScoring ?? Boolean(globalSettings.useGroupScoring),
+            };
+        });
+        const highestScore = Math.max(...scored.map((item) => item.score));
+        for (const item of scored) {
+            if (item.enabled && item.score < highestScore) {
+                resultsMap.delete(item.node.entryKey);
+                baselineActiveKeys.delete(item.node.entryKey);
+            }
+        }
+
+        liveCandidates = liveCandidates.filter((node) => resultsMap.has(node.entryKey));
+        if (liveCandidates.length > 1) {
+            const priorityWinners = liveCandidates
+                .filter((node) => Boolean(node.entry.groupOverride))
+                .sort((a, b) => Number(b.entry.order || 0) - Number(a.entry.order || 0));
+            if (priorityWinners.length > 0) {
+                const winner = priorityWinners[0];
+                for (const node of liveCandidates) {
+                    if (node.entryKey === winner.entryKey) continue;
+                    resultsMap.delete(node.entryKey);
+                    baselineActiveKeys.delete(node.entryKey);
+                }
+            }
         }
     }
 

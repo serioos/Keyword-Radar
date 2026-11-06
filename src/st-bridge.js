@@ -32,16 +32,18 @@ async function tryImportModule(candidatePaths) {
 }
 
 /**
- * Loads and caches SillyTavern core ES modules (`script.js`, `world-info.js`, `extensions.js`, `tokenizers.js`).
+ * Loads and caches SillyTavern core ES modules (`script.js`, `world-info.js`, `extensions.js`, `tokenizers.js`, `utils.js`).
  */
 export async function loadCoreModules() {
     if (cachedModules) return cachedModules;
 
-    const [scriptMod, worldInfoMod, extensionsMod, tokenizersMod, slashParserMod, slashCmdMod, slashArgMod] = await Promise.all([
+    const [scriptMod, worldInfoMod, extensionsMod, tokenizersMod, tagsMod, utilsMod, slashParserMod, slashCmdMod, slashArgMod] = await Promise.all([
         tryImportModule(['../../../../script.js', '../../../script.js', '/script.js']),
         tryImportModule(['../../../world-info.js', '../../world-info.js', '/scripts/world-info.js']),
         tryImportModule(['../../../extensions.js', '../../extensions.js', '/scripts/extensions.js']),
         tryImportModule(['../../../tokenizers.js', '../../tokenizers.js', '/scripts/tokenizers.js']),
+        tryImportModule(['../../../tags.js', '../../tags.js', '/scripts/tags.js']),
+        tryImportModule(['../../../utils.js', '../../utils.js', '/scripts/utils.js']),
         tryImportModule([
             '../../../slash-commands/SlashCommandParser.js',
             '../../slash-commands/SlashCommandParser.js',
@@ -64,6 +66,8 @@ export async function loadCoreModules() {
         worldInfo: worldInfoMod || {},
         extensions: extensionsMod || {},
         tokenizers: tokenizersMod || {},
+        tags: tagsMod || {},
+        utils: utilsMod || {},
         slashParser: slashParserMod || {},
         slashCmd: slashCmdMod || {},
         slashArg: slashArgMod || {},
@@ -84,6 +88,28 @@ export function getSTContext() {
         return cachedModules.extensions.getContext();
     }
     return {};
+}
+
+/**
+ * Resolves the active character filename using SillyTavern's current utils.js export.
+ * Older builds may expose the helper elsewhere, so avatar-based normalization is
+ * retained as a non-throwing fallback.
+ * @param {string|number|null|undefined} characterId
+ * @param {any} character
+ * @param {any} modules
+ * @returns {string}
+ */
+export function resolveCharacterFilename(characterId, character, modules = {}) {
+    const getFilename = modules?.utils?.getCharaFilename || modules?.script?.getCharaFilename;
+    if (typeof getFilename === 'function') {
+        try {
+            const filename = getFilename(characterId);
+            if (typeof filename === 'string' && filename) return filename;
+        } catch {
+            // Fall back to the character object when the core utility is unavailable.
+        }
+    }
+    return String(character?.avatar || '').split(/[\\/]/).pop().replace(/\.[^/.]+$/, '');
 }
 
 /**
@@ -206,11 +232,58 @@ export async function countTokensAsync(text) {
 /**
  * Reads current World Info global settings from `world-info.js` and DOM controls.
  */
-export function getWorldInfoGlobalSettings() {
-    const wi = cachedModules?.worldInfo?.world_info || {};
-    const includeNamesExport = cachedModules?.worldInfo?.world_info_include_names;
+export function normalizeWorldInfoGlobalSettings(live = {}, domReaders = {}) {
+    const readDomNumber = typeof domReaders.readNumber === 'function'
+        ? domReaders.readNumber
+        : (_selector, fallback) => fallback;
+    const readDomCheckbox = typeof domReaders.readCheckbox === 'function'
+        ? domReaders.readCheckbox
+        : (_selector, fallback) => fallback;
 
-    const readDomNumber = (selector, fallback) => {
+    const pickNumber = (key, selector, fallback) => {
+        const value = live[key];
+        if (value !== undefined && value !== null && value !== '') {
+            const parsed = Number(value);
+            if (Number.isFinite(parsed)) return parsed;
+        }
+        return readDomNumber(selector, fallback);
+    };
+
+    const pickBoolean = (key, selector, fallback) => {
+        if (typeof live[key] === 'boolean') return live[key];
+        if (live[key] !== undefined && live[key] !== null) return Boolean(live[key]);
+        return readDomCheckbox(selector, fallback);
+    };
+
+    return {
+        scanDepth: Math.max(0, pickNumber('world_info_depth', '#world_info_depth', 2)),
+        recursive: pickBoolean('world_info_recursive', '#world_info_recursive', false),
+        maxRecursionSteps: Math.max(0, pickNumber('world_info_max_recursion_steps', '#world_info_max_recursion_steps', 0)),
+        caseSensitive: pickBoolean('world_info_case_sensitive', '#world_info_case_sensitive', false),
+        matchWholeWords: pickBoolean('world_info_match_whole_words', '#world_info_match_whole_words', false),
+        includeNames: pickBoolean('world_info_include_names', '#world_info_include_names', true),
+        budget: Math.max(0, pickNumber('world_info_budget', '#world_info_budget', 25)),
+        budgetCap: Math.max(0, pickNumber('world_info_budget_cap', '#world_info_budget_cap', 0)),
+        minActivations: Math.max(0, pickNumber('world_info_min_activations', '#world_info_min_activations', 0)),
+        minActivationsDepthMax: Math.max(0, pickNumber('world_info_min_activations_depth_max', '#world_info_min_activations_depth_max', 0)),
+        useGroupScoring: pickBoolean('world_info_use_group_scoring', '#world_info_use_group_scoring', false),
+        characterStrategy: pickNumber('world_info_character_strategy', '#world_info_character_strategy', 1),
+    };
+}
+
+/**
+ * Reads current World Info global settings from SillyTavern's authoritative live getter,
+ * falling back to the visible controls on older clients.
+ */
+export function getWorldInfoGlobalSettings() {
+    let live = {};
+    try {
+        live = cachedModules?.worldInfo?.getWorldInfoSettings?.() || {};
+    } catch (err) {
+        console.warn('[Keyword Radar] Could not read live World Info settings:', err);
+    }
+
+    const readNumber = (selector, fallback) => {
         if (typeof document === 'undefined') return fallback;
         const el = document.querySelector(selector);
         if (!el || el.value === '' || el.value === undefined) return fallback;
@@ -218,32 +291,13 @@ export function getWorldInfoGlobalSettings() {
         return Number.isFinite(parsed) ? parsed : fallback;
     };
 
-    const readDomCheckbox = (selector, fallback) => {
+    const readCheckbox = (selector, fallback) => {
         if (typeof document === 'undefined') return fallback;
         const el = document.querySelector(selector);
-        if (!el) return fallback;
-        return Boolean(el.checked);
+        return el ? Boolean(el.checked) : fallback;
     };
 
-    const scanDepth = wi.world_info_depth ?? readDomNumber('#world_info_depth', 2);
-    const recursive = wi.world_info_recursive ?? readDomCheckbox('#world_info_recursive', true);
-    const maxRecursionSteps = wi.world_info_max_recursion_steps ?? readDomNumber('#world_info_max_recursion_steps', 0);
-    const caseSensitive = wi.world_info_case_sensitive ?? readDomCheckbox('#world_info_case_sensitive', false);
-    const matchWholeWords = wi.world_info_match_whole_words ?? readDomCheckbox('#world_info_match_whole_words', true);
-    const includeNames = includeNamesExport ?? wi.world_info_include_names ?? readDomCheckbox('#world_info_include_names', true);
-    const budget = wi.world_info_budget ?? readDomNumber('#world_info_budget', 25);
-    const budgetCap = wi.world_info_budget_cap ?? readDomNumber('#world_info_budget_cap', 0);
-
-    return {
-        scanDepth: Math.max(0, Number(scanDepth) || 2),
-        recursive: Boolean(recursive),
-        maxRecursionSteps: Math.max(0, Number(maxRecursionSteps) || 0),
-        caseSensitive: Boolean(caseSensitive),
-        matchWholeWords: Boolean(matchWholeWords),
-        includeNames: Boolean(includeNames),
-        budget: Number(budget) || 25,
-        budgetCap: Number(budgetCap) || 0,
-    };
+    return normalizeWorldInfoGlobalSettings(live, { readNumber, readCheckbox });
 }
 
 /**
@@ -381,75 +435,57 @@ export async function collectActiveLorebooksAndContext() {
         }
     };
 
-    // 1. Character Lorebooks (Single character or Group chat members)
+    // Match the current core World Info loader: the active character's book
+    // plus its auxiliary books, followed by chat/persona/global books. The
+    // core does not sweep every group member's lorebook into this scan.
     const characters = ctx.characters || cachedModules?.script?.characters || [];
     const chid = ctx.characterId ?? cachedModules?.script?.this_chid;
-    const groupId = ctx.groupId ?? cachedModules?.worldInfo?.selected_group;
-    const groups = ctx.groups || [];
-    const charLoreArray = Array.isArray(wiSettings.char_lore) ? wiSettings.char_lore : [];
+    const charLoreArray = Array.isArray(wiSettings.charLore)
+        ? wiSettings.charLore
+        : (Array.isArray(wiSettings.char_lore) ? wiSettings.char_lore : []);
+    const chatMeta = ctx.chatMetadata || cachedModules?.script?.chat_metadata || {};
+    const chatWorld = chatMeta['world_info'];
+    const powerUser = ctx.powerUserSettings || cachedModules?.script?.power_user || {};
+    const personaWorld = powerUser?.persona_description_lorebook;
+    const selectedGlobal = Array.isArray(cachedModules?.worldInfo?.selected_world_info)
+        ? cachedModules.worldInfo.selected_world_info
+        : [];
 
     const addCharacterWorlds = (charObj) => {
         if (!charObj) return;
         const primaryWorld = charObj?.data?.extensions?.world || charObj?.world;
-        if (primaryWorld) {
+        if (primaryWorld && !selectedGlobal.includes(primaryWorld) && primaryWorld !== chatWorld && primaryWorld !== personaWorld) {
             addBook(primaryWorld, 'character', `Character (${charObj.name || 'Primary'})`);
         }
-        const avatarFile = String(charObj.avatar || '').replace(/\.png$/i, '');
-        const auxEntry = charLoreArray.find(
-            (item) => item?.name === avatarFile || item?.name === charObj.avatar || item?.name === charObj.name,
-        );
+
+        const avatarFile = resolveCharacterFilename(chid, charObj, cachedModules);
+        const auxEntry = charLoreArray.find((item) => item?.name === avatarFile);
         if (auxEntry && Array.isArray(auxEntry.extraBooks)) {
             for (const extra of auxEntry.extraBooks) {
-                addBook(extra, 'character', `Character Aux (${charObj.name || 'Aux'})`);
+                if (extra && !selectedGlobal.includes(extra) && extra !== chatWorld && extra !== personaWorld) {
+                    addBook(extra, 'character', `Character Aux (${charObj.name || 'Aux'})`);
+                }
             }
         }
     };
 
-    if (groupId && Array.isArray(groups)) {
-        const activeGroup = groups.find((g) => String(g.id) === String(groupId));
-        if (activeGroup && Array.isArray(activeGroup.members)) {
-            for (const memberAvatar of activeGroup.members) {
-                const memberChar = characters.find((c) => c?.avatar === memberAvatar);
-                addCharacterWorlds(memberChar);
-            }
-        }
-    } else if (chid !== undefined && chid !== null && characters[chid]) {
+    if (chid !== undefined && chid !== null && characters[chid]) {
         addCharacterWorlds(characters[chid]);
     }
 
-    // 2. Chat Lorebook
-    const chatMeta = ctx.chatMetadata || cachedModules?.script?.chat_metadata || {};
-    const chatWorld = chatMeta['world_info'];
-    if (chatWorld && typeof chatWorld === 'string') {
+    // 2. Chat Lorebook (already-loaded global books take precedence in core)
+    if (chatWorld && typeof chatWorld === 'string' && !selectedGlobal.includes(chatWorld)) {
         addBook(chatWorld, 'chat', 'Current Chat Lorebook');
     }
 
-    // 3. Persona Lorebook
-    const powerUser = ctx.powerUserSettings || cachedModules?.script?.power_user || {};
-    const userAvatar = ctx.userAvatar || cachedModules?.script?.user_avatar;
-    const personaDescriptor = userAvatar && powerUser?.persona_descriptions?.[userAvatar];
-    if (personaDescriptor?.lorebook) {
-        addBook(personaDescriptor.lorebook, 'persona', 'Persona Lorebook');
-    } else if (powerUser?.persona_description_lorebook) {
-        addBook(powerUser.persona_description_lorebook, 'persona', 'Persona Lorebook');
+    // 3. Persona Lorebook (core uses the active power-user setting)
+    if (personaWorld && personaWorld !== chatWorld && !selectedGlobal.includes(personaWorld)) {
+        addBook(personaWorld, 'persona', 'Persona Lorebook');
     }
 
     // 4. Global Lorebooks
-    const selectedGlobal = cachedModules?.worldInfo?.selected_world_info;
-    if (Array.isArray(selectedGlobal)) {
-        for (const bookName of selectedGlobal) {
-            addBook(bookName, 'global', 'Global World Info');
-        }
-    } else if (typeof document !== 'undefined') {
-        const selectEl = document.querySelector('#world_info');
-        if (selectEl && selectEl.selectedOptions) {
-            for (const opt of Array.from(selectEl.selectedOptions)) {
-                const bookName = opt.textContent?.trim() || opt.value;
-                if (bookName && !bookName.startsWith('---')) {
-                    addBook(bookName, 'global', 'Global World Info');
-                }
-            }
-        }
+    for (const bookName of selectedGlobal) {
+        addBook(bookName, 'global', 'Global World Info');
     }
 
     // Load all active books in parallel
@@ -467,17 +503,32 @@ export async function collectActiveLorebooksAndContext() {
         for (const [rawKey, rawEntry] of Object.entries(data.entries)) {
             if (!rawEntry || typeof rawEntry !== 'object') continue;
             const normalized = normalizeWorldInfoEntry(rawEntry, rawKey, bookMeta.name, bookMeta.scope);
+            normalized.hash = computeWorldInfoEntryHash(rawEntry, bookMeta.name);
             allEntries.push(normalized);
         }
     }
 
     // Build Scan Context (Chat messages, character fields, timed effects)
     const activeChar = (chid !== undefined && chid !== null && characters[chid]) ? characters[chid] : null;
-    const charAvatarClean = activeChar?.avatar ? String(activeChar.avatar).replace(/\.png$/i, '') : '';
-    const tagMap = ctx.tagMap || {};
-    const characterTags = (activeChar?.avatar && Array.isArray(tagMap[activeChar.avatar]))
-        ? tagMap[activeChar.avatar].map((t) => t?.name || t).filter(Boolean)
-        : [];
+    const charAvatarClean = activeChar?.avatar ? String(activeChar.avatar).split(/[\\/]/).pop().replace(/\.[^/.]+$/, '') : '';
+    const characterFilename = resolveCharacterFilename(chid, activeChar, cachedModules) || charAvatarClean;
+    const tagMap = ctx.tagMap || cachedModules?.tags?.tag_map || cachedModules?.script?.tag_map || {};
+    let tagKey;
+    const tagResolver = cachedModules?.tags?.getTagKeyForEntity;
+    if (typeof tagResolver === 'function') {
+        try {
+            tagKey = tagResolver(chid);
+        } catch {
+            tagKey = undefined;
+        }
+    } else {
+        // Older clients may key their tag map by the character avatar.
+        tagKey = activeChar?.avatar;
+    }
+    const hasCharacterTagMap = Boolean(tagKey && Array.isArray(tagMap[tagKey]));
+    const characterTags = hasCharacterTagMap
+        ? tagMap[tagKey].map(String)
+        : undefined;
 
     const rawChat = Array.isArray(ctx.chat) ? ctx.chat : [];
     const chatMessages = rawChat
@@ -492,8 +543,31 @@ export async function collectActiveLorebooksAndContext() {
     // Extract active sticky & cooldown timed effects from chat_metadata.timedWorldInfo
     const timedEffects = extractTimedEffects(chatMeta, rawChat.length, allEntries);
 
+    const extensionPromptRegistry = cachedModules?.script?.extension_prompts || ctx.extensionPrompts || {};
+    const promptResolver = cachedModules?.script?.getExtensionPromptByName;
+    let injectionPrompts = '';
+    if (extensionPromptRegistry && typeof promptResolver === 'function') {
+        const scanPromptNames = Object.entries(extensionPromptRegistry)
+            .filter(([, promptInfo]) => Boolean(promptInfo?.scan))
+            .map(([promptName]) => promptName);
+        if (scanPromptNames.length > 0) {
+            const promptValues = await Promise.all(scanPromptNames.map(async (promptName) => {
+                try {
+                    return await promptResolver(promptName);
+                } catch {
+                    return '';
+                }
+            }));
+            injectionPrompts = promptValues
+                .filter((value) => typeof value === 'string' && value.trim().length > 0)
+                .map((value) => value.trim())
+                .join('\n');
+        }
+    }
+
     const extraScanFields = {
-        personaDescription: substituteMacros(powerUser?.persona_description || personaDescriptor?.description || ''),
+        injectionPrompts,
+        personaDescription: substituteMacros(powerUser?.persona_description || ''),
         characterDescription: substituteMacros(activeChar?.description || activeChar?.data?.description || ''),
         characterPersonality: substituteMacros(activeChar?.personality || activeChar?.data?.personality || ''),
         characterDepthPrompt: substituteMacros(activeChar?.data?.extensions?.depth_prompt?.prompt || ''),
@@ -509,14 +583,106 @@ export async function collectActiveLorebooksAndContext() {
             name1: ctx.name1 || 'User',
             name2: ctx.name2 || activeChar?.name || 'Character',
             characterAvatar: charAvatarClean,
+            characterFilename,
             characterFullAvatar: activeChar?.avatar || '',
             characterTags,
+            characterTagsAvailable: hasCharacterTagMap,
+            generationTrigger: String(ctx.generationType || ctx.generation_type || 'normal'),
             chatMessages,
             totalChatLength: rawChat.length,
             timedEffects,
             extraScanFields,
         },
     };
+}
+
+/**
+ * Parses the two currently supported SillyTavern World Info content decorators.
+ * Mirrors the core rule that decorator lines are only read from the beginning
+ * of the content block.
+ * @param {string} content
+ * @returns {{ decorators: string[], content: string }}
+ */
+export function parseWorldInfoDecorators(content) {
+    const value = String(content ?? '');
+    if (!value.startsWith('@@')) return { decorators: [], content: value };
+
+    const lines = value.split('\n');
+    const decorators = [];
+    let fallbacked = false;
+    let contentStart = 0;
+    let foundContentLine = false;
+
+    for (let index = 0; index < lines.length; index++) {
+        const line = lines[index];
+        if (!line.startsWith('@@')) {
+            contentStart = index;
+            foundContentLine = true;
+            break;
+        }
+        if (line.startsWith('@@@') && !fallbacked) {
+            continue;
+        }
+        const candidate = line.startsWith('@@@') ? line.slice(1) : line;
+        if (candidate.startsWith('@@activate')) {
+            decorators.push('@@activate');
+            fallbacked = false;
+        } else if (candidate.startsWith('@@dont_activate')) {
+            decorators.push('@@dont_activate');
+            fallbacked = false;
+        } else {
+            fallbacked = true;
+        }
+    }
+
+    return {
+        decorators,
+        // Core keeps the original content intact when every line looks like a
+        // decorator (for example, a body containing only an unknown @@ token).
+        content: foundContentLine ? lines.slice(contentStart).join('\n') : value,
+    };
+}
+
+/**
+ * Fallback implementation of SillyTavern's current cyrb53 `getStringHash`.
+ * Used only if the core utility module cannot be imported.
+ * @param {string} str
+ * @param {number} [seed=0]
+ * @returns {number}
+ */
+function getCoreStringHashFallback(str, seed = 0) {
+    if (typeof str !== 'string') return 0;
+    let h1 = 0xdeadbeef ^ seed;
+    let h2 = 0x41c6ce57 ^ seed;
+    for (let i = 0; i < str.length; i++) {
+        const ch = str.charCodeAt(i);
+        h1 = Math.imul(h1 ^ ch, 2654435761);
+        h2 = Math.imul(h2 ^ ch, 1597334677);
+    }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return 4294967296 * (2097151 & h2) + (h1 >>> 0);
+}
+
+/**
+ * Computes the same entry hash SillyTavern's `getSortedEntries()` uses for sticky/cooldown state.
+ * It intentionally mirrors core property order: `{ uid, world, ...rest, decorators, content }`.
+ * @param {Record<string, any>} rawEntry
+ * @param {string} worldName
+ * @returns {number}
+ */
+export function computeWorldInfoEntryHash(rawEntry, worldName) {
+    const { uid, ...rest } = rawEntry && typeof rawEntry === 'object' ? rawEntry : {};
+    const coreEntry = { uid, world: worldName, ...rest };
+    const parsedContent = parseWorldInfoDecorators(String(coreEntry.content ?? ''));
+    const preparedEntry = {
+        ...coreEntry,
+        decorators: parsedContent.decorators,
+        content: parsedContent.content,
+    };
+    const serialized = JSON.stringify(preparedEntry);
+    const coreHash = cachedModules?.utils?.getStringHash;
+    return typeof coreHash === 'function' ? coreHash(serialized) : getCoreStringHashFallback(serialized);
 }
 
 /**
@@ -543,7 +709,7 @@ export function normalizeWorldInfoEntry(raw, fallbackUid, worldName, scope = 'gl
     const key = toArray(raw.key ?? raw.keys);
     const keysecondary = toArray(raw.keysecondary ?? raw.secondary_keys);
     const comment = String(raw.comment ?? raw.name ?? '').trim();
-    const content = String(raw.content ?? '');
+    const parsedContent = parseWorldInfoDecorators(String(raw.content ?? ''));
 
     return {
         uid,
@@ -554,7 +720,8 @@ export function normalizeWorldInfoEntry(raw, fallbackUid, worldName, scope = 'gl
         keysecondary,
         comment: comment || key[0] || `Entry #${uid}`,
         rawComment: comment,
-        content,
+        content: parsedContent.content,
+        decorators: parsedContent.decorators,
         constant: Boolean(raw.constant),
         vectorized: Boolean(raw.vectorized ?? ext.vectorized),
         selective: raw.selective !== undefined ? Boolean(raw.selective) : true,
@@ -580,7 +747,11 @@ export function normalizeWorldInfoEntry(raw, fallbackUid, worldName, scope = 'gl
         matchWholeWords: (raw.matchWholeWords !== null && raw.matchWholeWords !== undefined)
             ? Boolean(raw.matchWholeWords)
             : ((ext.match_whole_words !== null && ext.match_whole_words !== undefined) ? Boolean(ext.match_whole_words) : null),
-        useGroupScoring: Boolean(raw.useGroupScoring ?? ext.use_group_scoring),
+        useGroupScoring: raw.useGroupScoring !== undefined && raw.useGroupScoring !== null
+            ? Boolean(raw.useGroupScoring)
+            : (ext.use_group_scoring !== undefined && ext.use_group_scoring !== null
+                ? Boolean(ext.use_group_scoring)
+                : null),
         automationId: String(raw.automationId ?? ext.automation_id ?? ''),
         group: String(raw.group ?? ext.group ?? ''),
         groupOverride: Boolean(raw.groupOverride ?? ext.group_override),
@@ -626,7 +797,7 @@ function normalizeCharacterFilter(cf) {
  * @param {Array<any>} allEntries
  * @returns {{ sticky: Set<string>, cooldown: Set<string>, stickyTurnsLeft: Map<string, number> }}
  */
-function extractTimedEffects(chatMeta, chatLength, allEntries) {
+export function extractTimedEffects(chatMeta, chatLength, allEntries, upcomingMessages = 1) {
     const sticky = new Set();
     const cooldown = new Set();
     const stickyTurnsLeft = new Map();
@@ -636,68 +807,52 @@ function extractTimedEffects(chatMeta, chatLength, allEntries) {
         return { sticky, cooldown, stickyTurnsLeft };
     }
 
-    const entriesByWorld = new Map();
-    for (const entry of allEntries) {
-        if (!entriesByWorld.has(entry.world)) {
-            entriesByWorld.set(entry.world, []);
-        }
-        entriesByWorld.get(entry.world).push(entry);
+    // ST stores two top-level buckets: timedWorldInfo.sticky and
+    // timedWorldInfo.cooldown. Each is keyed by `${world}.${uid}`.
+    const entriesByTimedKey = new Map();
+    for (const entry of allEntries || []) {
+        if (!entry || entry.world === undefined || entry.uid === undefined) continue;
+        entriesByTimedKey.set(`${String(entry.world)}.${String(entry.uid)}`, entry);
     }
 
-    const inspectEffectBucket = (worldName, effectType, bucketObj) => {
-        if (!bucketObj || typeof bucketObj !== 'object') return;
-        const worldEntries = entriesByWorld.get(worldName) || [];
+    const scanChatLength = Math.max(0, Number(chatLength) || 0) + Math.max(0, Number(upcomingMessages) || 0);
 
-        for (const [effectKey, effectData] of Object.entries(bucketObj)) {
-            if (!effectData || typeof effectData !== 'object') continue;
-            const end = Number(effectData.end ?? 0);
-            const ignore = Boolean(effectData.ignore);
-            if (ignore || (end > 0 && chatLength >= end)) continue;
+    for (const effectType of ['sticky', 'cooldown']) {
+        const bucket = timedRoot[effectType];
+        if (!bucket || typeof bucket !== 'object' || Array.isArray(bucket)) continue;
 
-            const matchedEntry = worldEntries.find(
-                (e) =>
-                    String(e.uid) === String(effectKey) ||
-                    String(e.uid) === String(effectData.uid) ||
-                    (effectData.hash !== undefined && String(getEntryHashFallback(e)) === String(effectData.hash)),
-            );
+        for (const [timedKey, effect] of Object.entries(bucket)) {
+            if (!effect || typeof effect !== 'object') continue;
 
-            if (matchedEntry) {
-                if (effectType === 'sticky') {
-                    sticky.add(matchedEntry.entryKey);
-                    if (end > chatLength) {
-                        stickyTurnsLeft.set(matchedEntry.entryKey, end - chatLength);
-                    }
-                } else if (effectType === 'cooldown') {
-                    cooldown.add(matchedEntry.entryKey);
-                }
+            const entry = entriesByTimedKey.get(timedKey);
+            if (!entry) continue;
+            const currentHash = entry.hash ?? entry.raw?.hash;
+            if (currentHash !== undefined && currentHash !== null && effect.hash !== undefined
+                && String(currentHash) !== String(effect.hash)) continue;
+
+            const start = Number(effect.start);
+            const end = Number(effect.end);
+            if (!Number.isFinite(start) || !Number.isFinite(end)) continue;
+            if (scanChatLength <= start && !Boolean(effect.protected)) continue;
+            if (scanChatLength >= end) continue;
+
+            // ST discards old timed effects when an entry is no longer configured
+            // with that effect. Avoid showing stale timers in the radar.
+            if (!(Number(entry[effectType]) > 0)) continue;
+
+            if (effectType === 'sticky') {
+                sticky.add(entry.entryKey);
+                stickyTurnsLeft.set(entry.entryKey, Math.max(0, end - scanChatLength));
+            } else {
+                cooldown.add(entry.entryKey);
             }
         }
-    };
-
-    for (const [worldName, worldEffects] of Object.entries(timedRoot)) {
-        if (!worldEffects || typeof worldEffects !== 'object') continue;
-        inspectEffectBucket(worldName, 'sticky', worldEffects.sticky);
-        inspectEffectBucket(worldName, 'cooldown', worldEffects.cooldown);
     }
 
     return { sticky, cooldown, stickyTurnsLeft };
 }
 
-/**
- * Computes a string hash matching SillyTavern's `getStringHash` for timed effect correlation.
- * @param {any} entry
- * @returns {number}
- */
-function getEntryHashFallback(entry) {
-    const str = `${entry.world}.${entry.uid}.${entry.comment}.${entry.content}`;
-    let hash = 0;
-    for (let i = 0; i < str.length; i++) {
-        const chr = str.charCodeAt(i);
-        hash = ((hash << 5) - hash) + chr;
-        hash |= 0;
-    }
-    return Math.abs(hash);
-}
+
 
 /**
  * Opens the World Info panel and scrolls to / highlights a specific Lorebook entry.
