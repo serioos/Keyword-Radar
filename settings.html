@@ -1,140 +1,130 @@
-<div id="keyword_radar_settings" class="extension_settings">
+<div id="kr-settings-drawer" class="kr-settings-drawer">
     <div class="inline-drawer">
         <div class="inline-drawer-toggle inline-drawer-header">
             <b><i class="fa-solid fa-satellite-dish"></i> Keyword Radar</b>
             <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
         <div class="inline-drawer-content">
-            <div class="kr-settings-panel">
-                <p class="kr-settings-desc">
-                    Real-time pre-send Lorebook scanner, token impact estimator, one-turn mute, and manual entry booster.
-                </p>
-
-                <!-- Master Enable -->
-                <label class="checkbox_label" for="kr_setting_enabled">
-                    <input type="checkbox" id="kr_setting_enabled" />
-                    <span>Enable Keyword Radar</span>
-                </label>
-
-                <hr />
-
-                <!-- UI & Display Preferences -->
+            <div class="kr-settings-body">
                 <div class="kr-settings-group">
-                    <h4><i class="fa-solid fa-display"></i> Radar Bar &amp; Input Highlight</h4>
-
-                    <div class="kr-setting-row">
-                        <label for="kr_setting_filter_mode">Default Radar Filter View</label>
-                        <select id="kr_setting_filter_mode" class="text_pole">
-                            <option value="new-only">Newly Triggered by Draft Only (Recommended)</option>
-                            <option value="new-and-history">Draft + Recent Chat History Matches</option>
-                            <option value="all-active">All Active (Draft + History + Sticky + Constant)</option>
-                        </select>
-                    </div>
-
-                    <div class="kr-setting-row">
-                        <label for="kr_setting_ui_mode">Radar Bar Layout Mode</label>
-                        <select id="kr_setting_ui_mode" class="text_pole">
-                            <option value="pill-bar">Always-Visible Pill Bar</option>
-                            <option value="compact-icon">Compact Collapsible Summary Strip</option>
-                        </select>
-                    </div>
-
-                    <label class="checkbox_label" for="kr_setting_auto_hide">
-                        <input type="checkbox" id="kr_setting_auto_hide" />
-                        <span>Auto-hide Radar Bar when no entries match</span>
+                    <label class="checkbox_label" for="kr_enabled">
+                        <input id="kr_enabled" type="checkbox" />
+                        <span>Enable Keyword Radar</span>
                     </label>
-
-                    <label class="checkbox_label" for="kr_setting_highlight_input">
-                        <input type="checkbox" id="kr_setting_highlight_input" />
-                        <span>Highlight matched trigger words inside the chat input box</span>
-                    </label>
-
-                    <label class="checkbox_label" for="kr_setting_hover_preview">
-                        <input type="checkbox" id="kr_setting_hover_preview" />
-                        <span>Show Quick Entry Inspection Popover on badge hover</span>
-                    </label>
-
-                    <label class="checkbox_label" for="kr_setting_show_muted">
-                        <input type="checkbox" id="kr_setting_show_muted" />
-                        <span>Keep muted entries visible as dimmed/strikethrough pills</span>
-                    </label>
+                    <small class="kr-settings-hint">Scan your draft in real time for Lorebook triggers before sending. Automatically idles when no Lorebooks are active.</small>
                 </div>
 
-                <hr />
-
-                <!-- One-Turn Mute & Recursion Lifecycle -->
                 <div class="kr-settings-group">
-                    <h4><i class="fa-solid fa-volume-xmark"></i> Mute Lifecycle &amp; Recursion</h4>
+                    <label class="checkbox_label" for="kr_auto_hide_idle">
+                        <input id="kr_auto_hide_idle" type="checkbox" />
+                        <span>Hide Radar bar when there are no new draft triggers</span>
+                    </label>
+                    <small class="kr-settings-hint">Keeps the chat input completely clean until a word in your draft triggers an entry (or you boost one).</small>
+                </div>
 
-                    <label class="checkbox_label" for="kr_setting_mute_recursion">
-                        <input type="checkbox" id="kr_setting_mute_recursion" />
+                <div class="kr-settings-group">
+                    <label class="checkbox_label" for="kr_reduce_animations">
+                        <input id="kr_reduce_animations" type="checkbox" />
+                        <span>Reduce Animations</span>
+                    </label>
+                    <small class="kr-settings-hint">Disables transitions, pop-in animations, and heavy blur repaints for maximum snappiness.</small>
+                </div>
+
+                <div class="kr-settings-group">
+                    <label for="kr_debounce_ms" class="kr-settings-label-row">
+                        <span>Typing Scan Delay</span>
+                        <span id="kr_debounce_ms_value" class="kr-settings-value">180 ms</span>
+                    </label>
+                    <input id="kr_debounce_ms" type="range" min="50" max="1000" step="10" value="180" />
+                    <small class="kr-settings-hint">Lower values feel more instant; higher values reduce CPU work on very large Lorebooks.</small>
+                </div>
+
+                <div class="kr-settings-group">
+                    <label for="kr_filter_mode">Default Radar Bar Filter</label>
+                    <select id="kr_filter_mode" class="text_pole">
+                        <option value="draft_only">Newly triggered by draft (+ recursive &amp; boosted)</option>
+                        <option value="all_active">All active entries (draft + history, constant, sticky)</option>
+                    </select>
+                </div>
+
+                <div class="kr-settings-group">
+                    <label for="kr_display_mode">Radar Bar Display Style</label>
+                    <select id="kr_display_mode" class="text_pole">
+                        <option value="bar">Always-visible pill bar</option>
+                        <option value="compact">Compact collapsible radar icon</option>
+                    </select>
+                </div>
+
+                <div class="kr-settings-group">
+                    <label class="checkbox_label" for="kr_mute_blocks_children">
+                        <input id="kr_mute_blocks_children" type="checkbox" />
                         <span>Muting a parent entry also blocks its recursive child entries</span>
                     </label>
-
-                    <label class="checkbox_label" for="kr_setting_persist_swipes">
-                        <input type="checkbox" id="kr_setting_persist_swipes" />
-                        <span>Keep One-Turn Mutes &amp; Boosts active across swipes/regenerations on the same turn</span>
-                    </label>
-
-                    <label class="checkbox_label" for="kr_setting_simulate_recursion">
-                        <input type="checkbox" id="kr_setting_simulate_recursion" />
-                        <span>Detect recursive chains even if global World Info recursion is off</span>
-                    </label>
+                    <small class="kr-settings-hint">When unchecked, recursive children that would have been woken up by a muted parent are still force-activated.</small>
                 </div>
 
-                <hr />
-
-                <!-- Sensitivity & Thresholds -->
                 <div class="kr-settings-group">
-                    <h4><i class="fa-solid fa-sliders"></i> Scan Sensitivity &amp; Token Warnings</h4>
-
-                    <div class="kr-setting-slider-row">
-                        <div class="kr-slider-header">
-                            <label for="kr_setting_scan_delay">Typing Scan Debounce Delay (ms)</label>
-                            <span id="kr_setting_scan_delay_val" class="kr-slider-val">160</span>
-                        </div>
-                        <input type="range" id="kr_setting_scan_delay" min="30" max="1000" step="10" />
-                    </div>
-
-                    <div class="kr-setting-slider-row">
-                        <div class="kr-slider-header">
-                            <label for="kr_setting_token_warn">High Token Impact Warning Threshold (0 = Off)</label>
-                            <span id="kr_setting_token_warn_val" class="kr-slider-val">500</span>
-                        </div>
-                        <input type="range" id="kr_setting_token_warn" min="0" max="4000" step="50" />
-                    </div>
-
-                    <div class="kr-setting-slider-row">
-                        <div class="kr-slider-header">
-                            <label for="kr_setting_max_recursion">Max Simulated Recursion Depth</label>
-                            <span id="kr_setting_max_recursion_val" class="kr-slider-val">6</span>
-                        </div>
-                        <input type="range" id="kr_setting_max_recursion" min="1" max="12" step="1" />
-                    </div>
+                    <label class="checkbox_label" for="kr_keep_mute_on_swipe">
+                        <input id="kr_keep_mute_on_swipe" type="checkbox" />
+                        <span>Keep one-turn mutes &amp; boosts active across swipes on the same turn</span>
+                    </label>
+                    <small class="kr-settings-hint">Automatically restores once you send a new message on the next turn.</small>
                 </div>
 
-                <hr />
+                <div class="kr-settings-group">
+                    <label class="checkbox_label" for="kr_expand_on_edit">
+                        <input id="kr_expand_on_edit" type="checkbox" />
+                        <span>Auto-expand entry when clicking "Edit in World Info"</span>
+                    </label>
+                    <small class="kr-settings-hint">When unchecked, scrolls to and highlights the entry in World Info without opening its drawer.</small>
+                </div>
 
-                <!-- Diagnostics & Bug Report Collector -->
-                <div class="kr-settings-group kr-diagnostics-box">
-                    <h4><i class="fa-solid fa-bug"></i> Diagnostics &amp; Troubleshooting Logs</h4>
-                    <p class="kr-settings-desc">
-                        Captures World Info lifecycle hooks (<code>WORLDINFO_ENTRIES_LOADED</code>, <code>WORLDINFO_SCAN_DONE</code>, <code>WORLD_INFO_ACTIVATED</code>, and outgoing prompt verification) to diagnose any mute or boost issue.
-                    </p>
-                    <div class="kr-diag-actions">
-                        <button type="button" id="kr_btn_copy_diagnostics" class="menu_button kr-diag-primary-btn">
-                            <i class="fa-solid fa-clipboard-check"></i> Collect &amp; Copy Diagnostic Logs
-                        </button>
-                        <button type="button" id="kr_btn_view_diagnostics" class="menu_button">
-                            <i class="fa-solid fa-file-Waveform fa-file-code"></i> View / Download Logs
-                        </button>
-                        <button type="button" id="kr_btn_clear_diagnostics" class="menu_button" title="Clear recorded diagnostic events">
-                            <i class="fa-solid fa-trash-can"></i> Clear
-                        </button>
-                    </div>
-                    <div id="kr_diag_status" class="kr-diag-status">
-                        Flight recorder active — ready to collect logs after a mute/send test.
-                    </div>
+                <div class="kr-settings-group">
+                    <label class="checkbox_label" for="kr_highlight_draft">
+                        <input id="kr_highlight_draft" type="checkbox" />
+                        <span>Highlight triggering keywords inside the chat input box</span>
+                    </label>
+                </div>
+
+                <div class="kr-settings-group">
+                    <label class="checkbox_label" for="kr_hover_preview">
+                        <input id="kr_hover_preview" type="checkbox" />
+                        <span>Show entry preview popover on hover</span>
+                    </label>
+                </div>
+
+                <div class="kr-settings-group">
+                    <label class="checkbox_label" for="kr_show_budget_warning">
+                        <input id="kr_show_budget_warning" type="checkbox" />
+                        <span>Show World Info token budget &amp; overflow warnings</span>
+                    </label>
+                </div>
+
+                <div class="kr-settings-group">
+                    <label class="checkbox_label" for="kr_enable_hotkeys">
+                        <input id="kr_enable_hotkeys" type="checkbox" />
+                        <span>Enable keyboard shortcuts (Alt+B Boost menu, Alt+M mute trigger word at caret)</span>
+                    </label>
+                </div>
+
+                <div class="kr-settings-group kr-settings-inline-row">
+                    <label class="checkbox_label" for="kr_show_lorebook">
+                        <input id="kr_show_lorebook" type="checkbox" />
+                        <span>Show Lorebook name on pills</span>
+                    </label>
+                    <label class="checkbox_label" for="kr_show_tokens">
+                        <input id="kr_show_tokens" type="checkbox" />
+                        <span>Show token cost on pills</span>
+                    </label>
+                </div>
+
+                <div class="kr-settings-actions">
+                    <button id="kr_clear_overrides_btn" type="button" class="menu_button">
+                        <i class="fa-solid fa-rotate-left"></i> Clear Active Mutes &amp; Boosts (This Chat)
+                    </button>
+                    <button id="kr_clear_all_chats_mutes_btn" type="button" class="menu_button" title="Clears Keyword Radar's saved chat-mute list across all chats (chat files are never modified)">
+                        <i class="fa-solid fa-broom"></i> Unmute All Chat-Muted Entries (All Chats)
+                    </button>
                 </div>
             </div>
         </div>

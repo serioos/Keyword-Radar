@@ -1,78 +1,94 @@
 # Keyword Radar — Pre-Send Lorebook Scanner & One-Turn Mute
 
-**Keyword Radar 1.2.1** is a real-time pre-flight Lorebook (World Info) scanner and single-click suppression/boost extension for [SillyTavern](https://github.com/SillyTavern/SillyTavern).
-
-While typing a reply in SillyTavern, it is easy to casually use a common word—like *"shadow"*, *"crown"*, or *"tavern"*—without realizing it matches a trigger keyword for an 800-token Lorebook entry (plus recursive child entries) that has nothing to do with your current scene.
-
-**Keyword Radar** scans your draft in real time as you type, displays a non-intrusive radar bar right above the chat input box, highlights the exact triggering words in your draft, and lets you mute (or force-trigger) any entry for the upcoming turn with a single click.
+A production-ready [SillyTavern](https://github.com/SillyTavern/SillyTavern) extension (compatible with SillyTavern `1.12.0+` through `1.19.x`) that scans your draft message in real time as you type, shows a native-styled pre-flight radar of which Lorebook (World Info) entries your message is about to wake up, and lets you **one-turn mute** or **force-trigger** any entry with a single click.
 
 ---
 
-<img width="992" height="494" alt="brave_ojSOcA2suS" src="https://github.com/user-attachments/assets/07971c33-bf83-454d-acfa-fc1077a8c581" />
+## Features
+
+- **Real-Time Draft Scanning** across all active Lorebooks (Global, Character, Chat, and Persona) with zero-overhead idling when no Lorebooks are active.
+- **Full World Info Rule Fidelity**: supports standard keywords, secondary/optional filters (`AND ANY`, `NOT ALL`, `NOT ANY`, `AND ALL`), `/regex/flags`, whole-word & case-sensitivity rules, macro substitution (`{{user}}`, `{{char}}`), character/tag filters, generation-type triggers (`entry.triggers`), and timed effects (`sticky`, `cooldown`, `delay`).
+- **New vs. Already-Active Distinction**: clearly separates entries *newly triggered* by your current draft from entries *already active* via chat history, constant status, or sticky timers.
+- **Recursive Trigger Detection**: simulates multi-step recursion (`world_info_recursive`, `preventRecursion`, `excludeRecursion`, `delayUntilRecursion`) and traces the exact parent-to-child chain.
+- **Native SillyTavern Theme & Accessibility Integration**: styled directly with SillyTavern's `--SmartTheme*` CSS variables (`--SmartThemeBlurTintColor`, `--SmartThemeBlurStrength`, `--SmartThemeBorderColor`, `color-mix()`) and native `.menu_button` / `.text_pole` controls, with both a **Reduce Animations** toggle and `prefers-reduced-motion` support.
+- **Inline Draft Keyword Highlighting**: subtly highlights the exact triggering word(s) inside `#send_textarea` and emphasizes the linked word(s) when hovering over any radar pill.
+- **Quick Entry Preview & Inspection**: hover or click any badge to inspect full entry content, primary/secondary keywords, trigger trace, probability, inclusion group competitors, budget warnings, and jump straight to **Edit in World Info** (with an option to either auto-expand the entry or just scroll to & highlight it).
+- **One-Turn Mute & Extended Mutes**: click the mute icon on any badge to suppress it for the next generation only—without editing your Lorebook files—or right-click for **3 turns**, **5 turns**, **custom N turns**, or **remainder of this chat session** (persisted cleanly inside extension settings without touching chat files).
+- **Swipe & Continue-Friendly Lifecycle**: keeps one-turn mutes (and boosts) active while swiping, regenerating, or continuing the AI's reply on the same turn, then automatically restores them as soon as you advance to the next turn.
+- **Status-Aware Boost & Pre-Flight Manager**: click **Boost** (or press `Alt+B`) to inspect live trigger status (*Draft*, *Recursive via Parent*, *History*, *Constant*, *Sticky*, *Muted*, *Boosted*), toggle **"Hide already triggered"**, filter with quick status chips, preview recursive cascades before boosting, and boost or mute any entry in one place (including temporarily enabling disabled entries for one turn).
+- **World Info Budget, Probability & Inclusion Group Indicators**: warns when active entries exceed your configured World Info token budget (`world_info_budget` / `world_info_budget_cap`), flags `<100%` probability rolls, and surfaces competing inclusion group members (including comma-separated multi-group entries).
+- **Keyboard Shortcuts & Slash Commands**: `Alt+B` toggles the Boost Manager, `Alt+M` mutes or unmutes the trigger word(s) under your caret/selection, and STscript commands `/kr-mute`, `/kr-unmute`, `/kr-boost`, and `/kr-clear` support live autocomplete on SillyTavern `1.17+`.
+- **Clean Lifecycle Management**: integrates with SillyTavern `1.17+` extension `clean` and `disable` hooks for clean data removal and teardown.
 
 ---
 
-## ✨ Key Features
+## Installation
 
-### 1. Real-Time Draft Scanning
-- **Multi-Scope Lorebook Coverage:** Scans active World Info across **Character** (Primary and Auxiliary), **Chat**, **Persona**, and **Global** scopes.
-- **SillyTavern-Authentic Matching:** Mirrors primary and secondary key logic (`AND ANY`, `NOT ALL`, `NOT ANY`, `AND ALL`), native `/regex/flags`, whole-word boundaries, per-entry matching options, character name/tag filters, generation triggers when exposed by the active context, content decorators, and inclusion-group score pruning.
-- **New vs. Already-Active Differential:** Clearly distinguishes between entries that are **newly woken up by your draft** (`+N new`) versus entries that are **already active** from recent chat history, sticky timers, or constant status.
-- **Recursive Trigger Graph:** Detects multi-step recursive cascades (`Parent Entry -> Child Entry`) and displays exact parent-to-child provenance.
-
-### 2. Non-Intrusive Radar UI & Input Highlighting
-- **Compact Pill Bar:** Displays each detected entry as an interactive badge showing its title, Lorebook source, matched keyword hint, recursive chain count, and estimated token cost.
-- **Token Impact Summary:** Shows the total token cost of newly triggered entries (`+XXX tok`) and warns when your draft exceeds your configured token threshold.
-- **In-Place Input Highlighting:** Subtly underlines matched keywords directly inside `#send_textarea` without interfering with typing, cursor position, or undo history. Hovering over any badge spotlights the exact word(s) in your message that triggered it.
-
-### 3. Quick Entry Preview, Inspection & Inline Editing
-- **Hover / Click Inspection Popover:** Preview an entry's full text, primary/secondary keywords, and exact activation reason (direct draft match, recursive parent chain, sticky timer, or history depth).
-- **Quick-Edit Modal:** Permanently edit an entry's keywords, optional filter logic, or content right from the chat bar—or jump straight to the entry inside SillyTavern's World Info Editor.
-
-### 4. One-Turn Mute (Temporary Suppression)
-- **Single-Click Suppression:** Click the mute icon on any badge to suppress that entry **for the next generation only** without altering your Lorebook files.
-- **Swipe-Friendly Lifecycle:** Keeps your one-turn mute active if you swipe or regenerate the AI's reply on that turn, and automatically restores the entry to normal as soon as you send your next message.
-- **Recursive Blocking:** Muting a parent entry automatically prevents its recursive child entries from firing (configurable in settings).
-- **Extended Mute Context Menu:** Right-click any badge to mute an entry for **1, 3, 5, or 10 turns**, or for the **remainder of the current chat session**.
-
-### 5. One-Turn Manual Boost (Force-Trigger)
-- Click the **Boost** button in the radar bar to search across all active Lorebooks and force-inject any entry into the next turn—even if you didn't type its keyword in your message.
-
----
-
-## 📦 Installation
-
-1. Open SillyTavern and go to **Extensions** (`stacked blocks icon`) &rarr; **Install extension**.
-2. Paste the repository URL:
-   ```text
+### Recommended (SillyTavern Extension Installer)
+1. Open SillyTavern.
+2. Go to **Extensions** → **Install extension**.
+3. Paste the repository URL:
+   ```
    https://github.com/serioos/Keyword-Radar
    ```
-3. Enable **Keyword Radar** in the Extensions menu.
+4. Click **Install** and reload SillyTavern if prompted.
 
-## Compatibility and prediction limits
+### Manual Installation
+Clone or extract this repository into your SillyTavern third-party extensions folder:
+```bash
+cd SillyTavern/data/<your-user-handle>/extensions/
+git clone https://github.com/serioos/Keyword-Radar.git
+```
+Restart or refresh SillyTavern.
 
-- Reviewed against the official SillyTavern **1.19.0** release source and extension-manifest guidance. The manifest declares **1.15.0** as the minimum client version because the mutable `WORLDINFO_SCAN_DONE` hook used for reliable Stage 2 suppression is available from that release line.
-- The extension follows the current nested scan-event payload and removes muted entries from the authoritative `activated.entries` `Map`, not merely from diagnostic arrays.
-- The radar is a pre-send prediction, not a replacement for SillyTavern's World Info engine. It includes scan-enabled extension prompts through the current core registry/resolver when available, but it cannot perfectly predict probabilistic entries, weighted-random inclusion-group winners, prompt-budget truncation, or generation trigger values that are not exposed to the extension before send. For those cases, the live prompt remains authoritative.
-- Minimum-activation depth expansion is modeled for non-recursive scans when the current settings permit it. Recursive scans use a separate engine loop and are approximated by the radar's recursive trigger graph.
+---
 
-## Development checks
+## Slash Commands & Shortcuts
 
-Run the scanner and lifecycle regression tests from the extension directory:
+| Shortcut / Command | Action |
+| :--- | :--- |
+| `Alt + B` | Open or close the Boost & Pre-Flight Manager modal |
+| `Alt + M` | Mute (1 turn) or unmute the triggering entry(ies) under your caret or selection inside `#send_textarea` |
+| `/kr-mute <title, UID, or world.UID>` | Mute an entry for 1 turn (supports `turns=N` or `session=true`) |
+| `/kr-unmute <title, UID, or world.UID>` | Unmute a previously muted entry |
+| `/kr-boost <title, UID, or world.UID>` | Force-trigger an entry for the next turn |
+| `/kr-clear` | Clear all active mutes and manual boosts in the current chat |
+
+---
+
+## Extension Settings
+
+Open **Extensions → Keyword Radar** in SillyTavern to configure:
+
+| Setting | Default | Description |
+| :--- | :--- | :--- |
+| **Enable Keyword Radar** | On | Master toggle for scanning, UI bar, and generation interception. |
+| **Hide Radar bar when there are no new draft triggers** | Off | Keeps the chat input clean until a word in your draft triggers an entry (or you boost one). |
+| **Reduce Animations** | Off | Disables transitions, pop-in animations, and backdrop blur for maximum snappiness. |
+| **Typing Scan Delay** | `180 ms` | Debounce delay (`50–1000 ms`) while typing in `#send_textarea`. |
+| **Default Radar Bar Filter** | Newly triggered by draft | Show only draft-triggered (+ recursive & boosted) entries, or all active entries including history/constant/sticky. |
+| **Radar Bar Display Style** | Always-visible pill bar | Choose between an always-visible pill bar or a compact collapsible radar indicator. |
+| **Muting a parent blocks recursive children** | On | Prevents a muted parent entry from waking up recursive children. When disabled, affected recursive children are preserved via force-activation. |
+| **Keep one-turn mutes & boosts across swipes** | On | Keeps active turn overrides intact during `swipe`, `regenerate`, and `continue` on the same turn, then restores automatically on the next turn. |
+| **Auto-expand entry on "Edit in World Info"** | On | When unchecked, scrolls to and highlights the entry in World Info without opening its drawer. |
+| **Highlight triggering keywords in input** | On | Renders a non-intrusive scroll-synced highlight layer over `#send_textarea`. |
+| **Show entry preview popover on hover** | On | Opens the full entry preview popover on badge hover (clicking always opens a pinned popover). |
+| **Show World Info budget & overflow warnings** | On | Flags when active entries exceed your configured World Info token budget. |
+| **Enable keyboard shortcuts** | On | Enables `Alt+B` and `Alt+M` shortcuts. |
+| **Show Lorebook name / token cost on pills** | On | Controls whether each pill shows its source Lorebook name and token estimate. |
+
+---
+
+## Running Tests
+
+Keyword Radar has zero runtime npm dependencies. To run the automated test suite locally (Node.js 18+):
 
 ```bash
-node --experimental-default-type=module tests/scanner.test.js
+npm test
 ```
 
-The suite covers matching semantics, current World Info settings, core-compatible timed-effect hashing, decorators, generation triggers, depth-zero and extension-prompt scanning, inclusion-group scoring, minimum-activation depth, Stage 1 boost mutation, current Stage 2 `Map` suppression, per-loop scan diagnostics, and idempotent generation cleanup / swipe lifecycle behaviour.
+---
 
+## License
 
-### 1.2.1 log-driven lifecycle hardening
-
-- Coalesces closely spaced message/generation lifecycle refreshes into one fresh lore snapshot and scan.
-- Makes generation cleanup idempotent when SillyTavern sends more than one terminal notification for a generation; one-turn overrides are finalized only once.
-- Resets per-generation action diagnostics at generation start so reports cannot carry stale boosts/mutes forward.
-- Records SillyTavern's Stage 2 scan-loop state (`current`, `next`, `loopCount`), recursion-delay level, and budget to distinguish expected recursive passes from abnormal repeats.
-- Makes the chat-session mute action visibly toggle to **Unmute for Chat** in the popover and removes redundant session-mute actions from the context menu while already active; closes the popover after state changes.
-- Keeps current settings separate from unknown legacy preference names in diagnostic reports (`legacySettingsIgnored`) without deleting or rewriting user preferences.
-- Prevents an entry from retaining a swipe-persisted boost when it is muted (and vice versa), and reports deleted-prompt restoration counts separately for mutes and boosts.
+MIT License — see [LICENSE](./LICENSE).

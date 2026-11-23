@@ -1,1188 +1,702 @@
 /**
- * Keyword Radar — Real-Time Pre-Flight Lorebook Scanner Engine
- * https://github.com/serioos/Keyword-Radar
+ * Keyword Radar — Real-Time Draft Lorebook Scanner & Recursive Chain Analyzer
  *
- * Implements SillyTavern-authentic World Info matching:
- * - Primary keys (`key`) + Optional Filter / Secondary keys (`keysecondary`)
- * - Selective logic: AND ANY (0), NOT ALL (1), NOT ANY (2), AND ALL (3)
- * - Per-entry & global `caseSensitive` and `matchWholeWords`
- * - Native `/regex/flags` key syntax
- * - Per-entry `scanDepth`, `constant`, `disable`, `delay`, `cooldown`, `sticky`
- * - Character filter (`characterFilter` include/exclude by name or tag)
- * - Extra match targets (Persona, Character Description, Personality, Scenario, etc.)
- * - Differential analysis: Newly triggered by Draft vs. Already Active from History / Constant / Sticky
- * - Multi-step Recursive Trigger Graph with parent-to-child provenance & mute propagation
+ * Pure scanning engine that compares:
+ *   1) Baseline chat activation (recent chat history + constants + active sticky timers + recursion)
+ *   2) Draft-augmented activation (chat history + current user draft + boosts + recursion)
+ *
+ * Also computes:
+ *   - World Info token budget & overflow warnings
+ *   - Probability (<100%) & Inclusion Group (`group`, including comma-separated multi-groups) conflict metadata
+ *   - Recursive cascade previews for manual boosting
  */
 
-import { SELECTIVE_LOGIC, TRIGGER_STATUS } from './constants.js';
-import { escapeRegExp } from './utils.js';
+import { ACTIVATION_SOURCE } from './constants.js';
+import { evaluateEntryKeywords, findKeywordSpans } from './matcher.js';
+import { estimateTokensFast, getEntryKey, getEntryTitle, splitCsvList } from './utils.js';
+
+const JOINER = '\n';
 
 /**
- * Parses a SillyTavern regex key literal if formatted as `/pattern/flags`.
- * @param {string} rawKey
- * @returns {{ pattern: string, flags: string } | null}
+ * Format chat messages into a scan buffer string for a given scanDepth.
  */
-export function parseRegexKey(rawKey) {
-    if (typeof rawKey !== 'string') return null;
-    const trimmed = rawKey.trim();
-    if (!trimmed.startsWith('/')) return null;
-    const match = /^\/([\s\S]+)\/([gimsuy]*)$/.exec(trimmed);
-    if (!match) return null;
-    return {
-        pattern: match[1],
-        flags: match[2] || '',
-    };
+export function buildScanBuffer(messages, depth, includeNames = true) {
+    if (!Array.isArray(messages) || messages.length === 0 || depth <= 0) {
+        return '';
+    }
+    const visible = messages.filter((m) => m && !m.is_system && typeof m.mes === 'string');
+    const slice = visible.slice(-depth).reverse();
+    return slice
+        .map((m) => (includeNames && m.name ? `${m.name}: ${m.mes}` : m.mes))
+        .join(JOINER);
 }
 
 /**
- * Matches a single keyword or `/regex/flags` against a text haystack,
- * returning both boolean match status and character index spans when `collectSpans` is true.
- *
- * Mirrors SillyTavern's `WorldInfoBuffer.matchKeys` behavior:
- * - Regex keys `/.../flags` use native RegExp execution.
- * - Plain keys with `matchWholeWords: true` use non-word boundary assertions `(?:^|\W)(key)(?:$|\W)`
- *   when the key consists of a single word, or substring match when the key spans multiple words/punctuation.
- *
- * @param {string} haystack
- * @param {string} rawKey
- * @param {{
- *   caseSensitive: boolean,
- *   matchWholeWords: boolean,
- *   substituteFn?: (s: string) => string,
- *   collectSpans?: boolean
- * }} options
- * @returns {{ matched: boolean, key: string, matchedText: string, spans: Array<{ start: number, end: number, text: string, key: string }> }}
+ * Determine which entries have active sticky / cooldown / delay timed effects
+ * for a given chat length (without mutating `chat_metadata.timedWorldInfo`).
  */
-export function matchSingleKeyInText(haystack, rawKey, options) {
-    const emptyResult = { matched: false, key: rawKey, matchedText: '', spans: [] };
-    if (!haystack || !rawKey) return emptyResult;
+export function evaluateTimedEffectsReadOnly(entries, chatLength, timedWorldInfo) {
+    const stickyKeys = new Set();
+    const cooldownKeys = new Set();
+    const delayKeys = new Set();
 
-    const substitutedKey = typeof options.substituteFn === 'function'
-        ? options.substituteFn(rawKey).trim()
-        : String(rawKey).trim();
-    if (!substitutedKey) return emptyResult;
-
-    const regexDescriptor = parseRegexKey(substitutedKey);
-
-    try {
-        if (regexDescriptor) {
-            // SillyTavern treats a regex key as a regex verbatim. Entry/global
-            // case-sensitivity and whole-word settings do not alter its flags.
-            const flags = regexDescriptor.flags;
-            const detectionRx = new RegExp(regexDescriptor.pattern, flags);
-            const detectionMatch = detectionRx.test(haystack);
-            if (!detectionMatch || !options.collectSpans) {
-                return {
-                    matched: detectionMatch,
-                    key: rawKey,
-                    matchedText: detectionMatch ? (haystack.match(new RegExp(regexDescriptor.pattern, flags))?.[0] || '') : '',
-                    spans: [],
-                };
-            }
-
-            // Keep the user's regex flags. Global expressions can provide multiple
-            // highlight spans; non-global expressions match once just like ST's test().
-            const rx = new RegExp(regexDescriptor.pattern, flags);
-            const spans = [];
-            let firstText = '';
-            let m;
-            let safety = 0;
-            do {
-                m = rx.exec(haystack);
-                if (!m) break;
-                if (m[0].length > 0) {
-                    if (!firstText) firstText = m[0];
-                    spans.push({
-                        start: m.index,
-                        end: m.index + m[0].length,
-                        text: m[0],
-                        key: rawKey,
-                    });
-                }
-                // A global zero-width match must always advance or exec() can loop forever.
-                if (m[0].length === 0 && (rx.global || rx.sticky)) {
-                    rx.lastIndex++;
-                }
-                safety++;
-            } while (rx.global && safety < 250);
-
-            return {
-                matched: true,
-                key: rawKey,
-                matchedText: firstText,
-                spans,
-            };
+    const byHash = new Map();
+    for (const entry of entries) {
+        if (entry.hash !== undefined && entry.hash !== null) {
+            byHash.set(String(entry.hash), entry);
         }
-
-        // SillyTavern lowercases both sides for plain-text matching when insensitive.
-        const normalizedHaystack = options.caseSensitive ? String(haystack) : String(haystack).toLowerCase();
-        const normalizedKey = options.caseSensitive ? substitutedKey : substitutedKey.toLowerCase();
-        const escaped = escapeRegExp(normalizedKey);
-        const useWholeWords = Boolean(options.matchWholeWords);
-        // ST applies boundary checks to single whitespace-delimited words only.
-        // Multi-word phrases are literal substrings, even when they contain punctuation.
-        const hasMultipleWords = normalizedKey.split(/\s+/).length > 1;
-        const useWordBoundaries = useWholeWords && !hasMultipleWords;
-        const rx = useWordBoundaries
-            ? new RegExp(`(?:^|\\W)(${escaped})(?:$|\\W)`, 'g')
-            : new RegExp(escaped, 'g');
-        const spans = [];
-        let firstText = '';
-        let m;
-        let safety = 0;
-
-        while ((m = rx.exec(normalizedHaystack)) !== null && safety++ < 250) {
-            const wordMatch = useWordBoundaries ? m[1] : m[0];
-            if (!wordMatch.length) {
-                rx.lastIndex++;
-                continue;
-            }
-            const leadOffset = useWordBoundaries ? m[0].indexOf(wordMatch) : 0;
-            const actualStart = m.index + Math.max(0, leadOffset);
-            const actualEnd = actualStart + wordMatch.length;
-            const originalText = String(haystack).slice(actualStart, actualEnd);
-            if (!firstText) firstText = originalText;
-
-            if (options.collectSpans) {
-                spans.push({
-                    start: actualStart,
-                    end: actualEnd,
-                    text: originalText,
-                    key: rawKey,
-                });
-            } else {
-                return { matched: true, key: rawKey, matchedText: originalText, spans: [] };
-            }
-
-            // Reuse a trailing boundary as the next match's leading boundary.
-            if (useWordBoundaries && rx.lastIndex > actualEnd) {
-                rx.lastIndex = actualEnd;
-            }
-        }
-
-        return {
-            matched: spans.length > 0 || Boolean(firstText),
-            key: rawKey,
-            matchedText: firstText,
-            spans,
-        };
-    } catch {
-        return emptyResult;
     }
+
+    const stickyMap = timedWorldInfo?.sticky || {};
+    for (const [key, effect] of Object.entries(stickyMap)) {
+        if (!effect || typeof effect !== 'object') continue;
+        const entry = byHash.get(String(effect.hash));
+        const entryKey = entry ? getEntryKey(entry) : key;
+        if (chatLength <= Number(effect.start) && !effect.protected) continue;
+        if (chatLength >= Number(effect.end)) continue;
+        if (entry && !entry.sticky) continue;
+        stickyKeys.add(entryKey);
+    }
+
+    const cooldownMap = timedWorldInfo?.cooldown || {};
+    for (const [key, effect] of Object.entries(cooldownMap)) {
+        if (!effect || typeof effect !== 'object') continue;
+        const entry = byHash.get(String(effect.hash));
+        const entryKey = entry ? getEntryKey(entry) : key;
+        if (chatLength <= Number(effect.start) && !effect.protected) continue;
+        if (chatLength >= Number(effect.end)) continue;
+        if (entry && !entry.cooldown) continue;
+        cooldownKeys.add(entryKey);
+    }
+
+    for (const entry of entries) {
+        if (entry.delay && chatLength < Number(entry.delay)) {
+            delayKeys.add(getEntryKey(entry));
+        }
+    }
+
+    return { stickyKeys, cooldownKeys, delayKeys };
 }
 
-/**
- * Checks whether an entry passes its optional `characterFilter` against the active character.
- * @param {any} entry
- * @param {{ characterAvatar?: string, characterFilename?: string, characterFullAvatar?: string, name2?: string, characterTags?: string[] }} scanContext
- * @returns {boolean}
- */
-export function passesCharacterFilter(entry, scanContext) {
-    const cf = entry.characterFilter;
-    if (!cf) return true;
+function isEntryEligible(entry, { characterFilename, characterTags, cooldownKeys, delayKeys, stickyKeys, generationType = 'normal' }) {
+    if (!entry || entry.disable === true) return false;
 
-    const names = Array.isArray(cf.names) ? cf.names : [];
-    const tags = Array.isArray(cf.tags) ? cf.tags : [];
-    const isExclude = Boolean(cf.isExclude);
-
-    // SillyTavern evaluates name and tag constraints independently. If both
-    // are configured, both constraints must pass (rather than either matching).
-    if (names.length > 0) {
-        const characterFilename = String(scanContext.characterFilename || scanContext.characterAvatar || scanContext.characterFullAvatar || '')
-            .split(/[\\/]/)
-            .pop()
-            .replace(/\.png$/i, '');
-        const nameMatched = names.includes(characterFilename);
-        if (isExclude ? nameMatched : !nameMatched) return false;
+    // Respect SillyTavern generation type triggers (e.g. impersonate-only or quiet-only entries)
+    if (Array.isArray(entry.triggers) && entry.triggers.length > 0) {
+        if (!entry.triggers.includes(generationType)) {
+            return false;
+        }
     }
 
-    // Core skips tag filtering if it cannot resolve a tag-map key for the
-    // active entity. An available empty tag list, however, is a real no-match.
-    const hasTagMap = scanContext.characterTagsAvailable !== false && Array.isArray(scanContext.characterTags);
-    if (tags.length > 0 && hasTagMap) {
-        const activeTags = new Set(scanContext.characterTags.map(String));
-        const tagMatched = tags.some((tag) => activeTags.has(String(tag)));
-        if (isExclude ? tagMatched : !tagMatched) return false;
+    const key = getEntryKey(entry);
+    const isSticky = stickyKeys.has(key);
+
+    if (delayKeys.has(key)) return false;
+    if (cooldownKeys.has(key) && !isSticky) return false;
+
+    if (Array.isArray(entry.decorators) && entry.decorators.includes('@@dont_activate')) {
+        return false;
+    }
+
+    if (entry.characterFilter?.names?.length > 0 && characterFilename) {
+        const included = entry.characterFilter.names.includes(characterFilename);
+        const filtered = entry.characterFilter.isExclude ? included : !included;
+        if (filtered) return false;
+    }
+
+    // Match SillyTavern's world-info.js: only apply tag filter when a tagMap array exists for the active entity
+    if (entry.characterFilter?.tags?.length > 0 && Array.isArray(characterTags)) {
+        const includesTag = characterTags.some((t) => entry.characterFilter.tags.includes(t));
+        const filtered = entry.characterFilter.isExclude ? includesTag : !includesTag;
+        if (filtered) return false;
     }
 
     return true;
 }
 
-/**
- * Evaluates whether an entry's Primary + Secondary keys trigger against a given text buffer.
- * Also evaluates against the draft text specifically so we can highlight exact draft words.
- *
- * @param {any} entry
- * @param {string} fullScanBuffer The complete text buffer for this entry's scan depth + auxiliary fields
- * @param {string} draftText Raw draft text from `#send_textarea` (for span extraction)
- * @param {{
- *   caseSensitive: boolean,
- *   matchWholeWords: boolean,
- *   substituteFn?: (s: string) => string
- * }} globalMatchOpts
- * @returns {{
- *   triggered: boolean,
- *   matchedPrimaryKeys: string[],
- *   matchedSecondaryKeys: string[],
- *   draftMatchedPrimaryKeys: string[],
- *   draftMatchedSecondaryKeys: string[],
- *   draftSpans: Array<{ start: number, end: number, text: string, key: string, isSecondary: boolean }>
- * }}
- */
-export function evaluateEntryKeysAgainstBuffer(entry, fullScanBuffer, draftText, globalMatchOpts) {
-    const empty = {
-        triggered: false,
-        matchedPrimaryKeys: [],
-        matchedSecondaryKeys: [],
-        draftMatchedPrimaryKeys: [],
-        draftMatchedSecondaryKeys: [],
-        draftSpans: [],
-    };
+function runSimulationPass({
+    entries,
+    messages,
+    scanConfig,
+    timedEffects,
+    substituteParams,
+    characterFilename,
+    characterTags,
+    boostedKeys = new Set(),
+}) {
+    const activated = new Map();
+    const globalDepth = Math.max(0, Number(scanConfig.scanDepth ?? 2));
+    const includeNames = Boolean(scanConfig.includeNames ?? true);
+    const allowRecursion = Boolean(scanConfig.recursive);
+    const maxRecursionSteps = Number(scanConfig.maxRecursionSteps ?? 0);
 
-    const primaryKeys = Array.isArray(entry.key) ? entry.key.filter(Boolean) : [];
-    if (primaryKeys.length === 0) {
-        return empty;
-    }
-
-    const caseSensitive = entry.caseSensitive !== null && entry.caseSensitive !== undefined
-        ? Boolean(entry.caseSensitive)
-        : Boolean(globalMatchOpts.caseSensitive);
-
-    const matchWholeWords = entry.matchWholeWords !== null && entry.matchWholeWords !== undefined
-        ? Boolean(entry.matchWholeWords)
-        : Boolean(globalMatchOpts.matchWholeWords);
-
-    const matchOpts = {
-        caseSensitive,
-        matchWholeWords,
-        substituteFn: globalMatchOpts.substituteFn,
-        collectSpans: false,
-    };
-
-    const draftSpanOpts = {
-        ...matchOpts,
-        collectSpans: true,
-    };
-
-    // 1. Evaluate Primary Keys (OR logic: at least 1 primary key must match)
-    const matchedPrimaryKeys = [];
-    const draftMatchedPrimaryKeys = [];
-    const draftSpans = [];
-
-    for (const pk of primaryKeys) {
-        const res = matchSingleKeyInText(fullScanBuffer, pk, matchOpts);
-        if (res.matched) {
-            matchedPrimaryKeys.push(pk);
-            if (draftText) {
-                const draftRes = matchSingleKeyInText(draftText, pk, draftSpanOpts);
-                if (draftRes.matched) {
-                    draftMatchedPrimaryKeys.push(pk);
-                    for (const sp of draftRes.spans) {
-                        draftSpans.push({ ...sp, isSecondary: false });
-                    }
-                }
-            }
+    const depthBufferCache = new Map();
+    const getBufferForDepth = (depth) => {
+        const d = Math.max(0, Number(depth));
+        if (!depthBufferCache.has(d)) {
+            const raw = buildScanBuffer(messages, d, includeNames);
+            depthBufferCache.set(d, { raw, lower: raw.toLowerCase() });
         }
-    }
-
-    if (matchedPrimaryKeys.length === 0) {
-        return empty;
-    }
-
-    // 2. Evaluate Secondary / Optional Filter Keys if `selective` is enabled and secondary keys exist
-    const secondaryKeys = Array.isArray(entry.keysecondary) ? entry.keysecondary.filter(Boolean) : [];
-    const matchedSecondaryKeys = [];
-    const draftMatchedSecondaryKeys = [];
-
-    if (entry.selective && secondaryKeys.length > 0) {
-        for (const sk of secondaryKeys) {
-            const res = matchSingleKeyInText(fullScanBuffer, sk, matchOpts);
-            if (res.matched) {
-                matchedSecondaryKeys.push(sk);
-                if (draftText) {
-                    const draftRes = matchSingleKeyInText(draftText, sk, draftSpanOpts);
-                    if (draftRes.matched) {
-                        draftMatchedSecondaryKeys.push(sk);
-                        for (const sp of draftRes.spans) {
-                            draftSpans.push({ ...sp, isSecondary: true });
-                        }
-                    }
-                }
-            }
-        }
-
-        const totalSec = secondaryKeys.length;
-        const matchedSecCount = matchedSecondaryKeys.length;
-        const logic = Number(entry.selectiveLogic ?? SELECTIVE_LOGIC.AND_ANY);
-
-        let selectivePassed = true;
-        switch (logic) {
-            case SELECTIVE_LOGIC.AND_ANY:
-                selectivePassed = matchedSecCount >= 1;
-                break;
-            case SELECTIVE_LOGIC.NOT_ALL:
-                selectivePassed = matchedSecCount < totalSec;
-                break;
-            case SELECTIVE_LOGIC.NOT_ANY:
-                selectivePassed = matchedSecCount === 0;
-                break;
-            case SELECTIVE_LOGIC.AND_ALL:
-                selectivePassed = matchedSecCount === totalSec;
-                break;
-            default:
-                selectivePassed = matchedSecCount >= 1;
-                break;
-        }
-
-        if (!selectivePassed) {
-            return empty;
-        }
-    }
-
-    return {
-        triggered: true,
-        matchedPrimaryKeys,
-        matchedSecondaryKeys,
-        draftMatchedPrimaryKeys,
-        draftMatchedSecondaryKeys,
-        draftSpans,
-    };
-}
-
-
-/**
- * Calculates SillyTavern's inclusion-group score for an entry against one scan
- * buffer. Primary matches always score; secondary matches score for AND ANY,
- * and for AND ALL only when every secondary key matched. NOT logics do not add
- * secondary score. This is used only for the radar's predictive view.
- */
-export function calculateEntryGroupScore(entry, text, globalMatchOpts) {
-    const keys = Array.isArray(entry?.key) ? entry.key.filter(Boolean) : [];
-    if (keys.length === 0) return 0;
-
-    const caseSensitive = entry.caseSensitive !== null && entry.caseSensitive !== undefined
-        ? Boolean(entry.caseSensitive)
-        : Boolean(globalMatchOpts.caseSensitive);
-    const matchWholeWords = entry.matchWholeWords !== null && entry.matchWholeWords !== undefined
-        ? Boolean(entry.matchWholeWords)
-        : Boolean(globalMatchOpts.matchWholeWords);
-    const opts = {
-        caseSensitive,
-        matchWholeWords,
-        substituteFn: globalMatchOpts.substituteFn,
-        collectSpans: false,
-    };
-    const primaryScore = keys.reduce(
-        (score, key) => score + (matchSingleKeyInText(text, key, opts).matched ? 1 : 0),
-        0,
-    );
-    const secondary = Array.isArray(entry.keysecondary) ? entry.keysecondary.filter(Boolean) : [];
-    if (secondary.length === 0) return primaryScore;
-
-    const secondaryScore = secondary.reduce(
-        (score, key) => score + (matchSingleKeyInText(text, key, opts).matched ? 1 : 0),
-        0,
-    );
-    const logic = Number(entry.selectiveLogic ?? SELECTIVE_LOGIC.AND_ANY);
-    if (logic === SELECTIVE_LOGIC.AND_ANY) return primaryScore + secondaryScore;
-    if (logic === SELECTIVE_LOGIC.AND_ALL && secondaryScore === secondary.length) {
-        return primaryScore + secondaryScore;
-    }
-    return primaryScore;
-}
-
-/**
- * Builds the text scan buffer for a given scanDepth from recent chat messages + optional draft message.
- * Mirrors SillyTavern's `WorldInfoBuffer` depth slicing.
- *
- * @param {Array<{ name: string, mes: string, is_user: boolean }>} chatMessages
- * @param {string|null} draftText If non-null, appended as the upcoming user message at depth 0
- * @param {number} depth Number of messages from the end of chat to scan
- * @param {boolean} includeNames Whether to prefix messages with `Name: `
- * @param {string} userName
- * @returns {string}
- */
-export function buildDepthBuffer(chatMessages, draftText, depth, includeNames, userName = 'User') {
-    const effectiveDepth = Math.min(1000, Math.max(0, Number(depth) || 0));
-    if (effectiveDepth === 0) return '';
-
-    const messages = Array.isArray(chatMessages) ? chatMessages.slice() : [];
-    const hasDraft = typeof draftText === 'string' && draftText.length > 0;
-
-    if (hasDraft) {
-        messages.push({
-            name: userName,
-            mes: draftText,
-            is_user: true,
-        });
-    }
-
-    const sliceStart = Math.max(0, messages.length - effectiveDepth);
-    const recent = messages.slice(sliceStart);
-
-    const chunks = [];
-    for (let i = recent.length - 1; i >= 0; i--) {
-        const msg = recent[i];
-        if (!msg || typeof msg.mes !== 'string') continue;
-        if (includeNames && msg.name) {
-            chunks.push(`${msg.name}: ${msg.mes}`);
-        } else {
-            chunks.push(msg.mes);
-        }
-    }
-
-    // SillyTavern uses a non-word marker before each depth-buffer message. It
-    // also keeps a marker when the selected depth contains no chat messages.
-    return `\x01${chunks.join('\n\x01')}`;
-}
-
-/**
- * Appends any entry-configured auxiliary fields (persona, char description, scenario, etc.) to a scan buffer.
- * @param {any} entry
- * @param {string} baseBuffer
- * @param {any} extraScanFields
- * @returns {string}
- */
-function appendExtraMatchFields(entry, baseBuffer, extraScanFields, allowAuxiliary = true) {
-    if (!allowAuxiliary || !extraScanFields) return baseBuffer;
-    const extras = [];
-    if (entry.matchPersonaDescription && extraScanFields.personaDescription) {
-        extras.push(extraScanFields.personaDescription);
-    }
-    if (entry.matchCharacterDescription && extraScanFields.characterDescription) {
-        extras.push(extraScanFields.characterDescription);
-    }
-    if (entry.matchCharacterPersonality && extraScanFields.characterPersonality) {
-        extras.push(extraScanFields.characterPersonality);
-    }
-    if (entry.matchCharacterDepthPrompt && extraScanFields.characterDepthPrompt) {
-        extras.push(extraScanFields.characterDepthPrompt);
-    }
-    if (entry.matchScenario && extraScanFields.scenario) {
-        extras.push(extraScanFields.scenario);
-    }
-    if (entry.matchCreatorNotes && extraScanFields.creatorNotes) {
-        extras.push(extraScanFields.creatorNotes);
-    }
-    // Global scan-enabled extension prompts are appended for every entry by
-    // SillyTavern's WorldInfoBuffer, independent of per-entry auxiliary flags.
-    if (extraScanFields.injectionPrompts) {
-        extras.push(extraScanFields.injectionPrompts);
-    }
-    if (extras.length === 0) return baseBuffer;
-    return `${baseBuffer}\n${extras.join('\n')}`;
-}
-
-/**
- * Runs a complete pre-send radar scan comparing:
- * 1. Baseline state (what is *already* active from chat history, constants, and sticky timers without the draft)
- * 2. Draft state (what becomes active when the user's draft is included, plus recursive cascades and manual boosts)
- *
- * @param {{
- *   draftText: string,
- *   entries: Array<any>,
- *   globalSettings: {
- *     scanDepth: number,
- *     recursive: boolean,
- *     maxRecursionSteps: number,
- *     caseSensitive: boolean,
- *     matchWholeWords: boolean,
- *     includeNames: boolean
- *   },
- *   scanContext: {
- *     name1: string,
- *     name2: string,
- *     characterAvatar?: string,
- *     characterFullAvatar?: string,
- *     characterTags?: string[],
- *     chatMessages: Array<{ name: string, mes: string, is_user: boolean }>,
- *     totalChatLength?: number,
- *     timedEffects?: { sticky: Set<string>, cooldown: Set<string>, stickyTurnsLeft: Map<string, number> },
- *     extraScanFields?: any
- *   },
- *   mutedKeys: Set<string>,
- *   boostedEntriesMap: Map<string, any>,
- *   muteBlocksRecursion: boolean,
- *   simulateRecursionAlways: boolean,
- *   maxRecursionDepth: number,
- *   substituteFn?: (s: string) => string,
- *   tokenCounterFn?: (entry: any) => number
- * }} params
- */
-export function runPreSendRadarScan(params) {
-    const {
-        draftText = '',
-        entries = [],
-        globalSettings,
-        scanContext,
-        mutedKeys = new Set(),
-        boostedEntriesMap = new Map(),
-        muteBlocksRecursion = true,
-        simulateRecursionAlways = false,
-        maxRecursionDepth = 6,
-        substituteFn = (s) => s,
-        tokenCounterFn = () => 0,
-    } = params;
-
-    const cleanDraft = String(draftText ?? '');
-    const chatMessages = scanContext?.chatMessages || [];
-    const totalChatLength = scanContext?.totalChatLength ?? chatMessages.length;
-    const stickySet = scanContext?.timedEffects?.sticky || new Set();
-    const cooldownSet = scanContext?.timedEffects?.cooldown || new Set();
-    const stickyTurnsLeft = scanContext?.timedEffects?.stickyTurnsLeft || new Map();
-
-    // Cache depth buffers by depth number to avoid rebuilding identical strings
-    const historyDepthCache = new Map();
-    const withDraftDepthCache = new Map();
-    const draftOnlyBuffer = globalSettings.includeNames && scanContext?.name1
-        ? `${scanContext.name1}: ${cleanDraft}`
-        : cleanDraft;
-
-    const getHistoryBuffer = (depth) => {
-        if (!historyDepthCache.has(depth)) {
-            historyDepthCache.set(
-                depth,
-                buildDepthBuffer(chatMessages, null, depth, globalSettings.includeNames, scanContext?.name1),
-            );
-        }
-        return historyDepthCache.get(depth);
+        return depthBufferCache.get(d);
     };
 
-    const getWithDraftBuffer = (depth) => {
-        if (!withDraftDepthCache.has(depth)) {
-            withDraftDepthCache.set(
-                depth,
-                buildDepthBuffer(chatMessages, cleanDraft, depth, globalSettings.includeNames, scanContext?.name1),
-            );
-        }
-        return withDraftDepthCache.get(depth);
-    };
+    const availableDelayLevels = [...new Set(
+        entries
+            .filter((e) => e.delayUntilRecursion)
+            .map((e) => (e.delayUntilRecursion === true ? 1 : Number(e.delayUntilRecursion))),
+    )].sort((a, b) => a - b);
 
-    const globalMatchOpts = {
-        caseSensitive: Boolean(globalSettings.caseSensitive),
-        matchWholeWords: Boolean(globalSettings.matchWholeWords),
-        substituteFn,
-    };
+    let newlyActivatedThisStep = [];
 
-    // Filter eligible (enabled, non-cooldown, delay-satisfied, character-filter-passing) entries
-    const eligibleEntries = [];
     for (const entry of entries) {
-        if (entry.disable) continue;
-        if (Array.isArray(entry.decorators) && entry.decorators.includes('@@dont_activate')) continue;
-        if (cooldownSet.has(entry.entryKey) && !boostedEntriesMap.has(entry.entryKey)) continue;
-        // Delay check: entry cannot activate until at least `entry.delay` messages exist in chat
-        if (entry.delay > 0 && totalChatLength + 1 < entry.delay) continue;
-        if (!passesCharacterFilter(entry, scanContext || {})) continue;
-        const requiredTriggers = Array.isArray(entry.triggers) ? entry.triggers : [];
-        const generationTrigger = String(scanContext?.generationTrigger || 'normal');
-        if (requiredTriggers.length > 0 && !requiredTriggers.includes(generationTrigger)) continue;
-        eligibleEntries.push(entry);
-    }
-
-    // SillyTavern can increase the global depth one message at a time until
-    // `minActivations` is reached. Model that pre-pass when recursion is off;
-    // with recursion on, recursive activations can satisfy the threshold and
-    // the complete engine's loop ordering is more involved than a local preview.
-    let effectiveGlobalScanDepth = Math.max(0, Number(globalSettings.scanDepth ?? 2));
-    const minActivations = Math.max(0, Number(globalSettings.minActivations || 0));
-    const canPredictMinActivationDepth = minActivations > 0
-        && !globalSettings.recursive
-        && !(Number(globalSettings.maxRecursionSteps) > 0)
-        && !simulateRecursionAlways;
-    if (canPredictMinActivationDepth) {
-        const maxAvailableDepth = totalChatLength + (cleanDraft.trim().length > 0 ? 1 : 0);
-        const configuredMaxDepth = Math.max(0, Number(globalSettings.minActivationsDepthMax || 0));
-        const stopDepth = configuredMaxDepth > 0
-            ? Math.min(configuredMaxDepth, maxAvailableDepth)
-            : maxAvailableDepth;
-
-        const countDirectAtDepth = (globalDepth) => {
-            const candidates = [];
-            for (const entry of eligibleEntries) {
-                const depth = entry.scanDepth !== null && entry.scanDepth !== undefined
-                    ? Number(entry.scanDepth)
-                    : globalDepth;
-                const isSticky = stickySet.has(entry.entryKey);
-                const isConstant = Boolean(entry.constant);
-                const isBoosted = boostedEntriesMap.has(entry.entryKey);
-                const delayed = entry.delayUntilRecursion > 0 && !isSticky && !isBoosted;
-                const decoratorActivated = Array.isArray(entry.decorators) && entry.decorators.includes('@@activate');
-                if (isSticky || isBoosted) {
-                    candidates.push({ entry, sticky: isSticky, score: 0 });
-                    continue;
-                }
-                // Core applies delayUntilRecursion before decorators and constant
-                // activation. Sticky entries bypass it; one-turn boosts clear the
-                // entry's delayUntilRecursion value in Stage 1.
-                if (delayed) continue;
-                if (isConstant) {
-                    candidates.push({ entry, sticky: false, score: 0 });
-                    continue;
-                }
-                if (decoratorActivated) {
-                    candidates.push({ entry, sticky: false, score: 0 });
-                    continue;
-                }
-                if (depth <= 0) continue;
-                const base = cleanDraft.trim().length > 0 ? getWithDraftBuffer(depth) : getHistoryBuffer(depth);
-                const buffer = appendExtraMatchFields(entry, base, scanContext?.extraScanFields, depth > 0);
-                if (evaluateEntryKeysAgainstBuffer(entry, buffer, '', globalMatchOpts).triggered) {
-                    candidates.push({
-                        entry,
-                        sticky: false,
-                        score: calculateEntryGroupScore(entry, buffer, globalMatchOpts),
-                    });
-                }
-            }
-
-            const losingKeys = new Set();
-            const groups = new Map();
-            for (const candidate of candidates) {
-                for (const groupName of String(candidate.entry.group || '').split(',').map((name) => name.trim()).filter(Boolean)) {
-                    if (!groups.has(groupName)) groups.set(groupName, []);
-                    groups.get(groupName).push(candidate);
-                }
-            }
-            for (const group of groups.values()) {
-                if (group.length < 2) continue;
-                const stickyCandidates = group.filter((candidate) => candidate.sticky);
-                if (stickyCandidates.length > 0) {
-                    for (const candidate of group) {
-                        if (!candidate.sticky) losingKeys.add(candidate.entry.entryKey);
-                    }
-                    continue;
-                }
-                const scoringEnabled = Boolean(globalSettings.useGroupScoring)
-                    || group.some((candidate) => candidate.entry.useGroupScoring === true);
-                if (scoringEnabled) {
-                    const maxScore = Math.max(...group.map((candidate) => candidate.score));
-                    for (const candidate of group) {
-                        const enabled = candidate.entry.useGroupScoring ?? Boolean(globalSettings.useGroupScoring);
-                        if (enabled && candidate.score < maxScore) losingKeys.add(candidate.entry.entryKey);
-                    }
-                }
-                const remaining = group.filter((candidate) => !losingKeys.has(candidate.entry.entryKey));
-                if (remaining.length > 1) {
-                    const priorityWinners = remaining.filter((candidate) => Boolean(candidate.entry.groupOverride))
-                        .sort((a, b) => Number(b.entry.order || 0) - Number(a.entry.order || 0));
-                    if (priorityWinners.length > 0) {
-                        for (const candidate of remaining) {
-                            if (candidate.entry.entryKey !== priorityWinners[0].entry.entryKey) {
-                                losingKeys.add(candidate.entry.entryKey);
-                            }
-                        }
-                    }
-                }
-            }
-            return candidates.reduce((count, candidate) => count + (losingKeys.has(candidate.entry.entryKey) ? 0 : 1), 0);
-        };
-
-        let activeCount = countDirectAtDepth(effectiveGlobalScanDepth);
-        // Core tests `depth > max` after each pass, so the final pass can be
-        // one level beyond the configured cap. Preserve that boundary behavior.
-        while (activeCount < minActivations && effectiveGlobalScanDepth <= stopDepth) {
-            effectiveGlobalScanDepth += 1;
-            activeCount = countDirectAtDepth(effectiveGlobalScanDepth);
-        }
-    }
-
-    /**
-     * Step 1: Direct Activation Pass (Step 0 before recursion)
-     * Determine for each eligible entry:
-     * - Is it active in Baseline (Constant, Sticky, or History match)?
-     * - Is it active with Draft (Constant, Sticky, History+Draft match, or Draft-only match)?
-     * - Is it Newly Triggered specifically because of the Draft?
-     */
-    /** @type {Map<string, any>} */
-    const resultsMap = new Map();
-
-    /** @type {Set<string>} Entries active in baseline (without draft) */
-    const baselineActiveKeys = new Set();
-
-    /** @type {Set<string>} Entries directly active when draft is present */
-    const directWithDraftKeys = new Set();
-
-    for (const entry of eligibleEntries) {
-        const effectiveDepth = (entry.scanDepth !== null && entry.scanDepth !== undefined)
-            ? Number(entry.scanDepth)
-            : effectiveGlobalScanDepth;
-
-        const isSticky = stickySet.has(entry.entryKey);
-        const isConstant = Boolean(entry.constant);
-        const isBoosted = boostedEntriesMap.has(entry.entryKey);
-        const isDecoratorActivated = Array.isArray(entry.decorators) && entry.decorators.includes('@@activate');
-        const isDirectlyMuted = mutedKeys.has(entry.entryKey);
-
-        // Current SillyTavern delays entries before constant/decorator checks.
-        // Sticky entries bypass that gate; Stage 1 clears it for one-turn boosts.
-        const delayedForRecursionOnly = entry.delayUntilRecursion > 0 && !isSticky && !isBoosted;
-
-        let baselineEval = null;
-        let withDraftEval = null;
-        let draftOnlyEval = null;
-
-        if (!delayedForRecursionOnly && effectiveDepth > 0) {
-            const histBuf = appendExtraMatchFields(entry, getHistoryBuffer(effectiveDepth), scanContext?.extraScanFields, effectiveDepth > 0);
-            baselineEval = evaluateEntryKeysAgainstBuffer(entry, histBuf, '', globalMatchOpts);
-
-            if (cleanDraft.trim().length > 0) {
-                const draftBuf = appendExtraMatchFields(entry, getWithDraftBuffer(effectiveDepth), scanContext?.extraScanFields, effectiveDepth > 0);
-                withDraftEval = evaluateEntryKeysAgainstBuffer(entry, draftBuf, cleanDraft, globalMatchOpts);
-                draftOnlyEval = evaluateEntryKeysAgainstBuffer(entry, draftOnlyBuffer, cleanDraft, globalMatchOpts);
-            } else {
-                withDraftEval = baselineEval;
-            }
-        }
-
-        const activeInHistory = Boolean(baselineEval?.triggered);
-        const activeWithDraftKeywords = Boolean(withDraftEval?.triggered);
-        const matchedInDraftTextItself = Boolean(
-            draftOnlyEval?.triggered ||
-            (withDraftEval?.triggered &&
-                ((withDraftEval.draftMatchedPrimaryKeys?.length || 0) > 0 ||
-                    (withDraftEval.draftMatchedSecondaryKeys?.length || 0) > 0)),
-        );
-
-        const decoratorCanActivate = isDecoratorActivated && !delayedForRecursionOnly;
-        const constantCanActivate = isConstant && !delayedForRecursionOnly;
-        if (isSticky || (!delayedForRecursionOnly && (isConstant || activeInHistory || decoratorCanActivate))) {
-            baselineActiveKeys.add(entry.entryKey);
-        }
-
-        const wouldActivateDirectly = isSticky || isBoosted || constantCanActivate || decoratorCanActivate || activeWithDraftKeywords;
-        if (wouldActivateDirectly) {
-            directWithDraftKeys.add(entry.entryKey);
-        }
-
-        // Determine if this entry is NEWLY triggered by the user's draft
-        // Case A: It was NOT active in baseline (not constant, not sticky, not in history), and now activates with draft.
-        // Case B: Even if it wasn't in history at depth N-1, or if a message scrolled out of depth window,
-        // if it wasn't in baselineActiveKeys and is in directWithDraftKeys, it's newly triggered by the draft.
-        const isNewlyTriggeredDirect = !baselineActiveKeys.has(entry.entryKey) && activeWithDraftKeywords;
-
-        if (wouldActivateDirectly) {
-            const tokens = tokenCounterFn(entry);
-            let status = TRIGGER_STATUS.ACTIVE_HISTORY;
-            if (isDirectlyMuted) {
-                status = TRIGGER_STATUS.MUTED;
-            } else if (isBoosted && !isNewlyTriggeredDirect && !baselineActiveKeys.has(entry.entryKey)) {
-                status = TRIGGER_STATUS.BOOSTED;
-            } else if (isNewlyTriggeredDirect) {
-                status = TRIGGER_STATUS.NEW_DIRECT;
-            } else if (isSticky) {
-                status = TRIGGER_STATUS.ACTIVE_STICKY;
-            } else if (constantCanActivate || decoratorCanActivate) {
-                status = TRIGGER_STATUS.ACTIVE_CONSTANT;
-            } else if (activeInHistory) {
-                status = TRIGGER_STATUS.ACTIVE_HISTORY;
-            }
-
-            resultsMap.set(entry.entryKey, {
+        const key = getEntryKey(entry);
+        if (boostedKeys.has(key)) {
+            const rec = {
                 entry,
-                entryKey: entry.entryKey,
-                status,
-                isNewFromDraft: isNewlyTriggeredDirect,
-                alsoMatchedInDraft: matchedInDraftTextItself,
-                isRecursive: false,
-                recursionStep: 0,
-                triggeredByParents: [],
-                triggeredChildren: [],
-                matchedPrimaryKeys: withDraftEval?.matchedPrimaryKeys || [],
-                matchedSecondaryKeys: withDraftEval?.matchedSecondaryKeys || [],
-                draftMatchedPrimaryKeys: withDraftEval?.draftMatchedPrimaryKeys || [],
-                draftMatchedSecondaryKeys: withDraftEval?.draftMatchedSecondaryKeys || [],
-                draftSpans: withDraftEval?.draftSpans || [],
-                stickyTurnsRemaining: stickyTurnsLeft.get(entry.entryKey) || 0,
-                tokens,
-                isMuted: isDirectlyMuted,
-                isBoosted,
-            });
-        }
-    }
-
-    // Also include manually boosted entries that weren't in eligibleEntries (e.g., from another book or disabled)
-    for (const [boostKey, boostObj] of boostedEntriesMap.entries()) {
-        if (!resultsMap.has(boostKey) && boostObj?.entrySnapshot) {
-            const snap = boostObj.entrySnapshot;
-            const isDirectlyMuted = mutedKeys.has(boostKey);
-            resultsMap.set(boostKey, {
-                entry: snap,
-                entryKey: boostKey,
-                status: isDirectlyMuted ? TRIGGER_STATUS.MUTED : TRIGGER_STATUS.BOOSTED,
-                isNewFromDraft: true,
-                alsoMatchedInDraft: false,
-                isRecursive: false,
-                recursionStep: 0,
-                triggeredByParents: [],
-                triggeredChildren: [],
-                matchedPrimaryKeys: [],
-                matchedSecondaryKeys: [],
-                draftMatchedPrimaryKeys: [],
-                draftMatchedSecondaryKeys: [],
-                draftSpans: [],
-                stickyTurnsRemaining: 0,
-                tokens: tokenCounterFn(snap),
-                isMuted: isDirectlyMuted,
-                isBoosted: true,
-            });
-        }
-    }
-
-    // Inclusion-group scoring mirrors SillyTavern's score-based pruning for
-    // direct candidates. Weighted-random/groupOverride selection is intentionally
-    // not simulated because the result is stochastic and can change on each run.
-    const directGroupCandidates = Array.from(resultsMap.values()).filter(
-        (node) => String(node.entry?.group || '').trim().length > 0,
-    );
-    const groupedCandidates = new Map();
-    for (const node of directGroupCandidates) {
-        for (const groupName of String(node.entry.group).split(',').map((name) => name.trim()).filter(Boolean)) {
-            if (!groupedCandidates.has(groupName)) groupedCandidates.set(groupName, []);
-            groupedCandidates.get(groupName).push(node);
-        }
-    }
-
-    for (const [groupName, candidates] of groupedCandidates.entries()) {
-        if (candidates.length < 2) continue;
-        const scoringEnabledForGroup = Boolean(globalSettings.useGroupScoring)
-            || candidates.some((node) => node.entry.useGroupScoring === true);
-        if (!scoringEnabledForGroup) continue;
-        let liveCandidates = candidates.filter((node) => resultsMap.has(node.entryKey));
-        // A sticky member wins its inclusion group before score/priority rules.
-        const stickyCandidates = liveCandidates.filter((node) => stickySet.has(node.entryKey));
-        if (stickyCandidates.length > 0) {
-            for (const node of liveCandidates) {
-                if (stickySet.has(node.entryKey)) continue;
-                resultsMap.delete(node.entryKey);
-                baselineActiveKeys.delete(node.entryKey);
+                key,
+                reason: 'boosted',
+                evalResult: null,
+                recursionDepth: 0,
+                triggeredBy: [],
+            };
+            activated.set(key, rec);
+            if (!entry.preventRecursion) {
+                newlyActivatedThisStep.push({ key, title: getEntryTitle(entry), content: entry.content || '' });
             }
             continue;
         }
 
-        const scored = liveCandidates.map((node) => {
-            const depth = node.entry.scanDepth !== null && node.entry.scanDepth !== undefined
-                ? Number(node.entry.scanDepth)
-                : effectiveGlobalScanDepth;
-            const text = appendExtraMatchFields(
-                node.entry,
-                cleanDraft.trim().length > 0 ? getWithDraftBuffer(depth) : getHistoryBuffer(depth),
-                scanContext?.extraScanFields,
-                depth > 0,
-            );
-            return {
-                node,
-                score: calculateEntryGroupScore(node.entry, text, globalMatchOpts),
-                enabled: node.entry.useGroupScoring ?? Boolean(globalSettings.useGroupScoring),
+        if (!isEntryEligible(entry, { characterFilename, characterTags, ...timedEffects })) {
+            continue;
+        }
+
+        const isSticky = timedEffects.stickyKeys.has(key);
+        if (entry.delayUntilRecursion && !isSticky) {
+            continue;
+        }
+
+        if (Array.isArray(entry.decorators) && entry.decorators.includes('@@activate')) {
+            const rec = { entry, key, reason: 'constant', evalResult: null, recursionDepth: 0, triggeredBy: [] };
+            activated.set(key, rec);
+            if (!entry.preventRecursion) {
+                newlyActivatedThisStep.push({ key, title: getEntryTitle(entry), content: entry.content || '' });
+            }
+            continue;
+        }
+
+        if (entry.constant) {
+            const rec = { entry, key, reason: 'constant', evalResult: null, recursionDepth: 0, triggeredBy: [] };
+            activated.set(key, rec);
+            if (!entry.preventRecursion) {
+                newlyActivatedThisStep.push({ key, title: getEntryTitle(entry), content: entry.content || '' });
+            }
+            continue;
+        }
+
+        if (isSticky) {
+            const rec = { entry, key, reason: 'sticky', evalResult: null, recursionDepth: 0, triggeredBy: [] };
+            activated.set(key, rec);
+            if (!entry.preventRecursion) {
+                newlyActivatedThisStep.push({ key, title: getEntryTitle(entry), content: entry.content || '' });
+            }
+            continue;
+        }
+
+        const entryDepth = (entry.scanDepth !== null && entry.scanDepth !== undefined)
+            ? Number(entry.scanDepth)
+            : globalDepth;
+        const buf = getBufferForDepth(entryDepth);
+        const evalResult = evaluateEntryKeywords(entry, buf.raw, scanConfig, substituteParams, buf.lower);
+
+        if (evalResult.matched) {
+            const rec = {
+                entry,
+                key,
+                reason: 'keyword',
+                evalResult,
+                recursionDepth: 0,
+                triggeredBy: [],
             };
-        });
-        const highestScore = Math.max(...scored.map((item) => item.score));
-        for (const item of scored) {
-            if (item.enabled && item.score < highestScore) {
-                resultsMap.delete(item.node.entryKey);
-                baselineActiveKeys.delete(item.node.entryKey);
-            }
-        }
-
-        liveCandidates = liveCandidates.filter((node) => resultsMap.has(node.entryKey));
-        if (liveCandidates.length > 1) {
-            const priorityWinners = liveCandidates
-                .filter((node) => Boolean(node.entry.groupOverride))
-                .sort((a, b) => Number(b.entry.order || 0) - Number(a.entry.order || 0));
-            if (priorityWinners.length > 0) {
-                const winner = priorityWinners[0];
-                for (const node of liveCandidates) {
-                    if (node.entryKey === winner.entryKey) continue;
-                    resultsMap.delete(node.entryKey);
-                    baselineActiveKeys.delete(node.entryKey);
-                }
+            activated.set(key, rec);
+            if (!entry.preventRecursion) {
+                newlyActivatedThisStep.push({ key, title: getEntryTitle(entry), content: entry.content || '' });
             }
         }
     }
 
-    /**
-     * Step 2: Baseline Recursion Pass (without draft)
-     * So we accurately know which recursive entries were *already* active from history before typing.
-     */
-    const shouldRunRecursion = Boolean(globalSettings.recursive || simulateRecursionAlways);
-    const configuredMaxSteps = globalSettings.maxRecursionSteps > 0
-        ? Math.min(globalSettings.maxRecursionSteps, maxRecursionDepth)
-        : maxRecursionDepth;
+    if (allowRecursion) {
+        const recurseSources = [...newlyActivatedThisStep];
+        let step = 0;
+        const maxSteps = maxRecursionSteps > 0 ? maxRecursionSteps : 10;
+        let delayLevelIdx = 0;
 
-    if (shouldRunRecursion && configuredMaxSteps > 0) {
-        let currentWaveEntries = eligibleEntries.filter(
-            (e) => baselineActiveKeys.has(e.entryKey) && !e.preventRecursion && e.content,
-        );
-        let step = 1;
-
-        while (currentWaveEntries.length > 0 && step <= configuredMaxSteps) {
-            const nextWave = [];
-            const combinedParentText = currentWaveEntries.map((p) => substituteFn(p.content)).join('\n');
-
-            for (const candidate of eligibleEntries) {
-                if (baselineActiveKeys.has(candidate.entryKey)) continue;
-                if (candidate.excludeRecursion) continue;
-                if (candidate.delayUntilRecursion > 0 && step < candidate.delayUntilRecursion) continue;
-
-                const evalRes = evaluateEntryKeysAgainstBuffer(candidate, combinedParentText, '', globalMatchOpts);
-                if (evalRes.triggered) {
-                    baselineActiveKeys.add(candidate.entryKey);
-                    if (!candidate.preventRecursion && candidate.content) {
-                        nextWave.push(candidate);
-                    }
-                }
-            }
-            currentWaveEntries = nextWave;
+        while (step < maxSteps) {
             step++;
-        }
-    }
+            const currentDelayLevel = availableDelayLevels[delayLevelIdx] ?? 0;
+            const recurseText = recurseSources.map((s) => s.content).filter(Boolean).join(JOINER);
+            if (!recurseText && currentDelayLevel === 0) break;
 
-    /**
-     * Step 3: Draft + History Recursion Graph Pass
-     * Tracks exact parent -> child trigger links and propagates parent mutes when `muteBlocksRecursion` is enabled.
-     */
-    /** @type {Set<string>} */
-    const recursiveMutedKeys = new Set();
+            let addedInStep = 0;
+            const nextStepSources = [];
 
-    if (shouldRunRecursion && configuredMaxSteps > 0) {
-        let currentWaveNodes = Array.from(resultsMap.values()).filter(
-            (node) => !node.entry.preventRecursion && Boolean(node.entry.content),
-        );
-        let step = 1;
+            for (const entry of entries) {
+                const key = getEntryKey(entry);
+                if (activated.has(key)) continue;
+                if (!isEntryEligible(entry, { characterFilename, characterTags, ...timedEffects })) continue;
+                if (entry.excludeRecursion) continue;
 
-        while (currentWaveNodes.length > 0 && step <= configuredMaxSteps) {
-            const nextWaveNodes = [];
-
-            for (const candidate of eligibleEntries) {
-                if (resultsMap.has(candidate.entryKey)) continue;
-                if (candidate.excludeRecursion) continue;
-                if (candidate.delayUntilRecursion > 0 && step < candidate.delayUntilRecursion) continue;
-
-                const triggeringParents = [];
-                const matchedPrimarySet = new Set();
-                const matchedSecondarySet = new Set();
-
-                // Test each parent in the current wave individually so we know exact parent->child provenance
-                for (const parentNode of currentWaveNodes) {
-                    const parentContent = substituteFn(parentNode.entry.content || '');
-                    if (!parentContent) continue;
-
-                    const evalRes = evaluateEntryKeysAgainstBuffer(candidate, parentContent, '', globalMatchOpts);
-                    if (evalRes.triggered) {
-                        triggeringParents.push({
-                            entryKey: parentNode.entryKey,
-                            world: parentNode.entry.world,
-                            uid: parentNode.entry.uid,
-                            comment: parentNode.entry.comment,
-                            isNewFromDraft: parentNode.isNewFromDraft || parentNode.status === TRIGGER_STATUS.BOOSTED,
-                            isMuted: parentNode.isMuted || parentNode.status === TRIGGER_STATUS.MUTED_RECURSIVE,
-                            matchedKeys: evalRes.matchedPrimaryKeys,
-                        });
-                        evalRes.matchedPrimaryKeys.forEach((k) => matchedPrimarySet.add(k));
-                        evalRes.matchedSecondaryKeys.forEach((k) => matchedSecondarySet.add(k));
-                    }
+                if (entry.delayUntilRecursion) {
+                    const entryDelayLevel = entry.delayUntilRecursion === true ? 1 : Number(entry.delayUntilRecursion);
+                    if (entryDelayLevel > currentDelayLevel) continue;
                 }
 
-                if (triggeringParents.length > 0) {
-                    const isDirectlyMuted = mutedKeys.has(candidate.entryKey);
-                    const allParentsMuted = triggeringParents.every((p) => p.isMuted);
-                    const isRecursiveBlockedByMute = !isDirectlyMuted && muteBlocksRecursion && allParentsMuted;
+                const entryDepth = (entry.scanDepth !== null && entry.scanDepth !== undefined)
+                    ? Number(entry.scanDepth)
+                    : globalDepth;
+                const baseBuf = getBufferForDepth(entryDepth);
+                const combinedText = recurseText ? `${baseBuf.raw}${JOINER}${recurseText}` : baseBuf.raw;
+                const evalResult = evaluateEntryKeywords(entry, combinedText, scanConfig, substituteParams);
 
-                    if (isRecursiveBlockedByMute) {
-                        recursiveMutedKeys.add(candidate.entryKey);
-                    }
-
-                    const anyParentNew = triggeringParents.some((p) => p.isNewFromDraft);
-                    const wasInBaseline = baselineActiveKeys.has(candidate.entryKey);
-                    const isNewRecursive = !wasInBaseline || anyParentNew;
-
-                    let status = TRIGGER_STATUS.ACTIVE_HISTORY_RECURSIVE;
-                    if (isDirectlyMuted) {
-                        status = TRIGGER_STATUS.MUTED;
-                    } else if (isRecursiveBlockedByMute) {
-                        status = TRIGGER_STATUS.MUTED_RECURSIVE;
-                    } else if (isNewRecursive) {
-                        status = TRIGGER_STATUS.NEW_RECURSIVE;
-                    }
-
-                    const childNode = {
-                        entry: candidate,
-                        entryKey: candidate.entryKey,
-                        status,
-                        isNewFromDraft: isNewRecursive,
-                        alsoMatchedInDraft: false,
-                        isRecursive: true,
-                        recursionStep: step,
-                        triggeredByParents: triggeringParents,
-                        triggeredChildren: [],
-                        matchedPrimaryKeys: Array.from(matchedPrimarySet),
-                        matchedSecondaryKeys: Array.from(matchedSecondarySet),
-                        draftMatchedPrimaryKeys: [],
-                        draftMatchedSecondaryKeys: [],
-                        draftSpans: [],
-                        stickyTurnsRemaining: 0,
-                        tokens: tokenCounterFn(candidate),
-                        isMuted: isDirectlyMuted || isRecursiveBlockedByMute,
-                        isBoosted: false,
-                    };
-
-                    resultsMap.set(candidate.entryKey, childNode);
-
-                    // Link child to its triggering parents
-                    for (const pInfo of triggeringParents) {
-                        const parentNode = resultsMap.get(pInfo.entryKey);
-                        if (parentNode) {
-                            parentNode.triggeredChildren.push({
-                                entryKey: candidate.entryKey,
-                                world: candidate.world,
-                                uid: candidate.uid,
-                                comment: candidate.comment,
-                                tokens: childNode.tokens,
-                                matchedKeys: pInfo.matchedKeys,
+                if (evalResult.matched) {
+                    const triggeredBy = [];
+                    for (const src of recurseSources) {
+                        if (!src.content) continue;
+                        const parentEval = evaluateEntryKeywords(entry, src.content, scanConfig, substituteParams);
+                        if (parentEval.matched || parentEval.primaryMatches.length > 0) {
+                            triggeredBy.push({
+                                key: src.key,
+                                title: src.title,
+                                matchedKeyword: parentEval.primaryMatches[0]?.substituted || evalResult.primaryMatches[0]?.substituted || '',
                             });
                         }
                     }
+                    if (triggeredBy.length === 0 && recurseSources.length > 0) {
+                        for (const src of recurseSources) {
+                            const pm = evalResult.primaryMatches.find((m) =>
+                                evaluateEntryKeywords({ ...entry, key: [m.raw], selective: false }, src.content, scanConfig, substituteParams).matched,
+                            );
+                            if (pm) {
+                                triggeredBy.push({ key: src.key, title: src.title, matchedKeyword: pm.substituted });
+                            }
+                        }
+                    }
 
-                    if (!candidate.preventRecursion && candidate.content) {
-                        nextWaveNodes.push(childNode);
+                    const rec = {
+                        entry,
+                        key,
+                        reason: 'recursive',
+                        evalResult,
+                        recursionDepth: step,
+                        triggeredBy,
+                    };
+                    activated.set(key, rec);
+                    addedInStep++;
+
+                    if (!entry.preventRecursion) {
+                        nextStepSources.push({ key, title: getEntryTitle(entry), content: entry.content || '' });
                     }
                 }
             }
 
-            currentWaveNodes = nextWaveNodes;
-            step++;
-        }
-    }
-
-    // Collect all Draft Text Spans for input highlighting
-    const allDraftSpans = [];
-    for (const item of resultsMap.values()) {
-        if (Array.isArray(item.draftSpans) && item.draftSpans.length > 0) {
-            for (const sp of item.draftSpans) {
-                allDraftSpans.push({
-                    start: sp.start,
-                    end: sp.end,
-                    text: sp.text,
-                    key: sp.key,
-                    entryKey: item.entryKey,
-                    entryComment: item.entry.comment,
-                    status: item.status,
-                    isNewFromDraft: item.isNewFromDraft,
-                    isMuted: item.isMuted,
-                });
+            if (addedInStep > 0) {
+                recurseSources.push(...nextStepSources);
+            } else if (delayLevelIdx + 1 < availableDelayLevels.length) {
+                delayLevelIdx++;
+            } else {
+                break;
             }
         }
     }
 
-    // Sort results: Newly triggered direct -> Newly triggered recursive -> Boosted -> Muted -> History/Sticky/Constant
-    const statusPriority = {
-        [TRIGGER_STATUS.NEW_DIRECT]: 1,
-        [TRIGGER_STATUS.NEW_RECURSIVE]: 2,
-        [TRIGGER_STATUS.BOOSTED]: 3,
-        [TRIGGER_STATUS.MUTED]: 4,
-        [TRIGGER_STATUS.MUTED_RECURSIVE]: 5,
-        [TRIGGER_STATUS.ACTIVE_HISTORY]: 6,
-        [TRIGGER_STATUS.ACTIVE_HISTORY_RECURSIVE]: 7,
-        [TRIGGER_STATUS.ACTIVE_STICKY]: 8,
-        [TRIGGER_STATUS.ACTIVE_CONSTANT]: 9,
-    };
+    return activated;
+}
 
-    const allDetected = Array.from(resultsMap.values()).sort((a, b) => {
-        const pa = statusPriority[a.status] ?? 99;
-        const pb = statusPriority[b.status] ?? 99;
-        if (pa !== pb) return pa - pb;
-        return (b.tokens || 0) - (a.tokens || 0);
+/**
+ * Predict which additional recursive child entries would wake up if `targetEntry` were manually boosted.
+ * Used by the Boost Picker modal to show a live recursive cascade preview before pinning.
+ *
+ * @param {object} targetEntry
+ * @param {Array<object>} allEntries
+ * @param {Set<string>} alreadyActiveKeys
+ * @param {object} [scanConfig]
+ * @param {(s: string) => string} [substituteParams]
+ * @returns {{ children: Array<{ key: string, title: string, tokens: number }>, totalTokens: number }}
+ */
+export function previewRecursiveCascade(
+    targetEntry,
+    allEntries = [],
+    alreadyActiveKeys = new Set(),
+    scanConfig = {},
+    substituteParams = (s) => s,
+) {
+    if (!targetEntry || !scanConfig?.recursive || targetEntry.preventRecursion) {
+        return { children: [], totalTokens: 0 };
+    }
+    const content = String(targetEntry.content || '').trim();
+    if (!content) return { children: [], totalTokens: 0 };
+
+    const targetKey = getEntryKey(targetEntry);
+    const visited = new Set([targetKey, ...alreadyActiveKeys]);
+    const children = [];
+    const maxSteps = Number(scanConfig.maxRecursionSteps) > 0 ? Number(scanConfig.maxRecursionSteps) : 5;
+
+    let frontierText = content;
+    for (let step = 0; step < maxSteps; step++) {
+        const nextTexts = [];
+        const lowerFrontier = frontierText.toLowerCase();
+        for (const entry of allEntries) {
+            if (!entry || entry.disable || entry.excludeRecursion) continue;
+            if (Array.isArray(entry.triggers) && entry.triggers.length > 0 && !entry.triggers.includes('normal')) continue;
+            const key = getEntryKey(entry);
+            if (visited.has(key)) continue;
+
+            const evalRes = evaluateEntryKeywords(entry, frontierText, scanConfig, substituteParams, lowerFrontier);
+            if (evalRes.matched) {
+                visited.add(key);
+                const tokens = estimateTokensFast(entry.content || '');
+                children.push({ key, title: getEntryTitle(entry), tokens });
+                if (!entry.preventRecursion && entry.content) {
+                    nextTexts.push(entry.content);
+                }
+            }
+        }
+        if (nextTexts.length === 0) break;
+        frontierText = `${frontierText}${JOINER}${nextTexts.join(JOINER)}`;
+    }
+
+    const totalTokens = children.reduce((sum, c) => sum + c.tokens, 0);
+    return { children, totalTokens };
+}
+
+/**
+ * Scan active Lorebook entries against current chat history + the user's live draft message.
+ */
+export function scanDraftAgainstLorebooks({
+    entries = [],
+    chatMessages = [],
+    draftText = '',
+    userName = 'User',
+    timedWorldInfo = null,
+    scanConfig = {},
+    substituteParams = (s) => s,
+    characterFilename = '',
+    characterTags = null,
+    effectiveMutes = new Map(),
+    effectiveBoosts = new Map(),
+    muteBlocksRecursiveChildren = true,
+    tokenCache = null,
+    cachedBaseline = null,
+}) {
+    const trimmedDraft = String(draftText ?? '').trim();
+    const hasDraft = trimmedDraft.length > 0;
+    const boostedKeys = new Set(effectiveBoosts.keys());
+
+    // 1. Baseline pass: chat history ONLY (reuses cachedBaseline when chat history hasn't changed)
+    let baselineActivated = cachedBaseline;
+    if (!baselineActivated) {
+        const baselineTimed = evaluateTimedEffectsReadOnly(entries, chatMessages.length, timedWorldInfo);
+        baselineActivated = runSimulationPass({
+            entries,
+            messages: chatMessages,
+            scanConfig,
+            timedEffects: baselineTimed,
+            substituteParams,
+            characterFilename,
+            characterTags,
+            boostedKeys: new Set(),
+        });
+    }
+
+    // 2. Draft-augmented pass: chat history + user's draft message + manual boosts
+    const augmentedMessages = hasDraft
+        ? [...chatMessages, { name: userName, mes: draftText, is_user: true, is_system: false }]
+        : chatMessages;
+    const draftTimed = evaluateTimedEffectsReadOnly(entries, augmentedMessages.length, timedWorldInfo);
+    const draftActivated = runSimulationPass({
+        entries,
+        messages: augmentedMessages,
+        scanConfig,
+        timedEffects: draftTimed,
+        substituteParams,
+        characterFilename,
+        characterTags,
+        boostedKeys,
     });
 
-    // Compute token impact summaries
-    let newDraftTokens = 0;
-    let newDirectCount = 0;
-    let newRecursiveCount = 0;
-    let mutedSavedTokens = 0;
-    let mutedCount = 0;
-    let boostedTokens = 0;
-    let boostedCount = 0;
-    let alreadyActiveTokens = 0;
-    let alreadyActiveCount = 0;
+    // 3. Parent mute -> recursive child impact
+    const directlyMutedKeys = new Set(effectiveMutes.keys());
+    const suppressedByParentMuteKeys = new Set();
+    const preservedRecursiveChildren = [];
 
-    for (const item of allDetected) {
-        if (item.status === TRIGGER_STATUS.MUTED || item.status === TRIGGER_STATUS.MUTED_RECURSIVE) {
-            mutedCount++;
-            mutedSavedTokens += item.tokens;
-        } else if (item.status === TRIGGER_STATUS.BOOSTED) {
-            boostedCount++;
-            boostedTokens += item.tokens;
-            newDraftTokens += item.tokens;
-        } else if (item.status === TRIGGER_STATUS.NEW_DIRECT) {
-            newDirectCount++;
-            newDraftTokens += item.tokens;
-        } else if (item.status === TRIGGER_STATUS.NEW_RECURSIVE) {
-            newRecursiveCount++;
-            newDraftTokens += item.tokens;
+    if (directlyMutedKeys.size > 0) {
+        const unmutedEntries = entries.filter((e) => !directlyMutedKeys.has(getEntryKey(e)));
+        const afterMuteActivated = runSimulationPass({
+            entries: unmutedEntries,
+            messages: augmentedMessages,
+            scanConfig,
+            timedEffects: draftTimed,
+            substituteParams,
+            characterFilename,
+            characterTags,
+            boostedKeys,
+        });
+
+        for (const [key, rec] of draftActivated.entries()) {
+            if (directlyMutedKeys.has(key)) continue;
+            if (!afterMuteActivated.has(key) && rec.reason === 'recursive') {
+                if (muteBlocksRecursiveChildren) {
+                    suppressedByParentMuteKeys.add(key);
+                } else {
+                    preservedRecursiveChildren.push({
+                        world: rec.entry.world,
+                        uid: rec.entry.uid,
+                        entry: rec.entry,
+                    });
+                }
+            }
+        }
+    }
+
+    // 4. Build unified RadarMatch list and draft highlight spans
+    const matches = [];
+    const spanAccumulator = [];
+
+    for (const [key, rec] of draftActivated.entries()) {
+        const entry = rec.entry;
+        const wasInBaseline = baselineActivated.has(key);
+        const isBoosted = boostedKeys.has(key);
+        const isDirectlyMuted = directlyMutedKeys.has(key);
+        const isSuppressedByParent = suppressedByParentMuteKeys.has(key);
+        const isMuted = isDirectlyMuted || isSuppressedByParent;
+
+        let source;
+        if (isBoosted) {
+            source = ACTIVATION_SOURCE.BOOSTED;
+        } else if (rec.reason === 'constant') {
+            source = ACTIVATION_SOURCE.CONSTANT;
+        } else if (rec.reason === 'sticky') {
+            source = ACTIVATION_SOURCE.STICKY;
+        } else if (rec.reason === 'recursive') {
+            source = wasInBaseline ? ACTIVATION_SOURCE.RECURSIVE_HISTORY : ACTIVATION_SOURCE.RECURSIVE_DRAFT;
         } else {
-            alreadyActiveCount++;
-            alreadyActiveTokens += item.tokens;
+            source = wasInBaseline ? ACTIVATION_SOURCE.HISTORY : ACTIVATION_SOURCE.DRAFT;
+        }
+
+        const isNew = (
+            source === ACTIVATION_SOURCE.DRAFT ||
+            source === ACTIVATION_SOURCE.RECURSIVE_DRAFT ||
+            source === ACTIVATION_SOURCE.BOOSTED
+        );
+
+        const matchedKeywords = [];
+        if (rec.evalResult) {
+            for (const pm of rec.evalResult.primaryMatches) {
+                const spans = hasDraft ? findKeywordSpans(draftText, pm.substituted, entry, scanConfig) : [];
+                matchedKeywords.push({ ...pm, isSecondary: false, inDraft: spans.length > 0, spans });
+                for (const sp of spans) {
+                    spanAccumulator.push({ ...sp, entryKey: key, isMuted, isNew });
+                }
+            }
+            for (const sm of rec.evalResult.secondaryMatches) {
+                const spans = hasDraft ? findKeywordSpans(draftText, sm.substituted, entry, scanConfig) : [];
+                matchedKeywords.push({ ...sm, isSecondary: true, inDraft: spans.length > 0, spans });
+                for (const sp of spans) {
+                    spanAccumulator.push({ ...sp, entryKey: key, isMuted, isNew });
+                }
+            }
+        }
+
+        const tokens = (tokenCache && tokenCache.has(key))
+            ? tokenCache.get(key)
+            : estimateTokensFast(entry.content || '');
+
+        // Probability metadata (<100%)
+        const hasProbability = Boolean(entry.useProbability) && Number(entry.probability ?? 100) < 100;
+        const probability = hasProbability ? Math.max(0, Math.min(100, Number(entry.probability))) : 100;
+
+        // Inclusion group metadata (supports comma-separated multi-group names per SillyTavern's splitCsv)
+        const inclusionGroups = splitCsvList(entry.group);
+        const inclusionGroup = inclusionGroups.join(', ');
+
+        matches.push({
+            key,
+            uid: entry.uid,
+            world: entry.world || 'Unknown Lorebook',
+            title: getEntryTitle(entry),
+            content: entry.content || '',
+            entry,
+            source,
+            isNew,
+            isRecursive: rec.reason === 'recursive',
+            recursionDepth: rec.recursionDepth,
+            triggeredBy: rec.triggeredBy || [],
+            matchedKeywords,
+            selectiveLogic: rec.evalResult?.selectiveLogic ?? entry.selectiveLogic ?? 0,
+            hasSecondary: Boolean(rec.evalResult?.hasSecondary),
+            tokens,
+            isMuted,
+            isDirectlyMuted,
+            suppressedByParentMute: isSuppressedByParent,
+            muteInfo: effectiveMutes.get(key) || null,
+            isBoosted,
+            hasProbability,
+            probability,
+            inclusionGroup,
+            inclusionGroups,
+            groupCompetitors: [],
+            budgetOverflow: false,
+        });
+    }
+
+    // 5. Detect competing Inclusion Groups among active unmuted matches (supporting CSV multi-groups)
+    const groupMembers = new Map();
+    for (const m of matches) {
+        if (!m.isMuted && m.inclusionGroups.length > 0) {
+            for (const grp of m.inclusionGroups) {
+                if (!groupMembers.has(grp)) groupMembers.set(grp, []);
+                groupMembers.get(grp).push(m);
+            }
+        }
+    }
+    for (const [, members] of groupMembers.entries()) {
+        if (members.length > 1) {
+            for (const m of members) {
+                const existing = new Set(m.groupCompetitors);
+                for (const other of members) {
+                    if (other.key !== m.key) existing.add(other.title);
+                }
+                m.groupCompetitors = Array.from(existing);
+            }
+        }
+    }
+
+    // 6. Simulate World Info Token Budget & Overflow (respecting order & ignoreBudget)
+    const budgetTokens = Math.max(0, Number(scanConfig.budgetTokens ?? 0));
+    let budgetUsedTokens = 0;
+    let overflowCount = 0;
+
+    if (budgetTokens > 0) {
+        const activeOrdered = matches
+            .filter((m) => !m.isMuted)
+            .sort((a, b) => Number(b.entry?.order ?? 100) - Number(a.entry?.order ?? 100));
+
+        for (const m of activeOrdered) {
+            if (m.entry?.ignoreBudget) {
+                budgetUsedTokens += m.tokens;
+                continue;
+            }
+            if (budgetUsedTokens + m.tokens <= budgetTokens) {
+                budgetUsedTokens += m.tokens;
+            } else {
+                m.budgetOverflow = true;
+                overflowCount++;
+            }
+        }
+    } else {
+        budgetUsedTokens = matches.filter((m) => !m.isMuted).reduce((sum, m) => sum + m.tokens, 0);
+    }
+
+    // 7. Sort matches cleanly for display
+    const sourceRank = {
+        [ACTIVATION_SOURCE.BOOSTED]: 0,
+        [ACTIVATION_SOURCE.DRAFT]: 1,
+        [ACTIVATION_SOURCE.RECURSIVE_DRAFT]: 2,
+        [ACTIVATION_SOURCE.STICKY]: 3,
+        [ACTIVATION_SOURCE.HISTORY]: 4,
+        [ACTIVATION_SOURCE.RECURSIVE_HISTORY]: 5,
+        [ACTIVATION_SOURCE.CONSTANT]: 6,
+    };
+
+    matches.sort((a, b) => {
+        const diff = (sourceRank[a.source] ?? 99) - (sourceRank[b.source] ?? 99);
+        if (diff !== 0) return diff;
+        if (a.recursionDepth !== b.recursionDepth) return a.recursionDepth - b.recursionDepth;
+        return b.tokens - a.tokens;
+    });
+
+    // 8. Build summary metrics
+    const summary = {
+        newCount: 0,
+        activeNewCount: 0,
+        activeNewTokens: 0,
+        mutedCount: 0,
+        mutedTokens: 0,
+        alreadyActiveCount: 0,
+        alreadyActiveTokens: 0,
+        boostedCount: 0,
+        boostedTokens: 0,
+        totalActiveTokens: 0,
+        budgetTokens,
+        budgetUsedTokens,
+        budgetExceeded: budgetTokens > 0 && overflowCount > 0,
+        overflowCount,
+    };
+
+    for (const m of matches) {
+        if (m.isMuted) {
+            summary.mutedCount++;
+            summary.mutedTokens += m.tokens;
+        } else {
+            summary.totalActiveTokens += m.tokens;
+        }
+
+        if (m.isBoosted) {
+            summary.boostedCount++;
+            summary.boostedTokens += m.tokens;
+        }
+
+        if (m.isNew) {
+            summary.newCount++;
+            if (!m.isMuted) {
+                summary.activeNewCount++;
+                summary.activeNewTokens += m.tokens;
+            }
+        } else {
+            summary.alreadyActiveCount++;
+            if (!m.isMuted) {
+                summary.alreadyActiveTokens += m.tokens;
+            }
         }
     }
 
     return {
-        items: allDetected,
-        resultsMap,
-        recursiveMutedKeys,
-        draftSpans: mergeAndOrderDraftSpans(allDraftSpans),
-        summary: {
-            newDraftTokens,
-            newDirectCount,
-            newRecursiveCount,
-            newTotalCount: newDirectCount + newRecursiveCount + boostedCount,
-            mutedCount,
-            mutedSavedTokens,
-            boostedCount,
-            boostedTokens,
-            alreadyActiveCount,
-            alreadyActiveTokens,
-            totalActiveTokens: newDraftTokens + alreadyActiveTokens,
-        },
+        draftText,
+        matches,
+        draftSpans: spanAccumulator,
+        summary,
+        preservedRecursiveChildren,
+        baselineActivated,
+        timestamp: Date.now(),
     };
 }
 
 /**
- * Merges overlapping character spans in the draft text while retaining all associated `entryKeys`
- * so hovering an entry badge can spotlight its exact word(s) in `#send_textarea`.
+ * Find all matched Lorebook entries whose triggering keyword span in the draft
+ * covers the current caret position (or overlaps the current text selection).
  *
- * @param {Array<{ start: number, end: number, text: string, key: string, entryKey: string, entryComment: string, status: string, isNewFromDraft: boolean, isMuted: boolean }>} rawSpans
+ * @param {object|null} scanResult
+ * @param {number} selectionStart
+ * @param {number} [selectionEnd]
+ * @returns {Array<object>} Unique RadarMatch objects under the caret/selection
  */
-export function mergeAndOrderDraftSpans(rawSpans) {
-    if (!Array.isArray(rawSpans) || rawSpans.length === 0) return [];
+export function findMatchesAtCaret(scanResult, selectionStart, selectionEnd = selectionStart) {
+    if (!scanResult || !Array.isArray(scanResult.draftSpans) || !Array.isArray(scanResult.matches)) {
+        return [];
+    }
+    const start = Math.max(0, Number(selectionStart) || 0);
+    const end = Math.max(start, Number(selectionEnd) || start);
 
-    const sorted = rawSpans
-        .filter((s) => s.end > s.start)
-        .sort((a, b) => (a.start !== b.start ? a.start - b.start : b.end - a.end));
-
-    const merged = [];
-    for (const span of sorted) {
-        const last = merged[merged.length - 1];
-        if (!last || span.start >= last.end) {
-            merged.push({
-                start: span.start,
-                end: span.end,
-                entryKeys: [span.entryKey],
-                keys: [span.key],
-                hasNew: Boolean(span.isNewFromDraft),
-                allMuted: Boolean(span.isMuted),
-            });
-        } else {
-            // Overlapping span: extend end if needed and merge metadata
-            last.end = Math.max(last.end, span.end);
-            if (!last.entryKeys.includes(span.entryKey)) {
-                last.entryKeys.push(span.entryKey);
-            }
-            if (!last.keys.includes(span.key)) {
-                last.keys.push(span.key);
-            }
-            last.hasNew = last.hasNew || Boolean(span.isNewFromDraft);
-            last.allMuted = last.allMuted && Boolean(span.isMuted);
+    const hitKeys = new Set();
+    for (const sp of scanResult.draftSpans) {
+        if (!sp) continue;
+        const overlaps = start === end
+            ? (start >= sp.start && start <= sp.end)
+            : (start <= sp.end && end >= sp.start);
+        if (overlaps && sp.entryKey) {
+            hitKeys.add(sp.entryKey);
         }
     }
 
-    return merged;
+    if (hitKeys.size === 0) return [];
+    return scanResult.matches.filter((m) => hitKeys.has(m.key));
 }
