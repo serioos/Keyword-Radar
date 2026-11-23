@@ -2,6 +2,9 @@
 
 A production-ready [SillyTavern](https://github.com/SillyTavern/SillyTavern) extension (compatible with SillyTavern `1.12.0+` through `1.19.x`) that scans your draft message in real time as you type, shows a native-styled pre-flight radar of which Lorebook (World Info) entries your message is about to wake up, and lets you **one-turn mute** or **force-trigger** any entry with a single click.
 
+<img width="697" height="683" alt="image" src="https://github.com/user-attachments/assets/6021a561-e460-4357-b90e-855eb13eda0d" />
+<img width="968" height="188" alt="image" src="https://github.com/user-attachments/assets/9e300ec7-9384-48f2-9f87-f30d9848a986" />
+
 ---
 
 ## Features
